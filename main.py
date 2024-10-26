@@ -101,7 +101,9 @@ def pretrain_main(cfg: Cfig):
     decoder = PepMAE(
         hidden_dim=cfg.train.hid_dim,
         atom_feat_dim=cfg.train.atom_dim,
-        fragment_feat_dim=cfg.train.pharm_dim
+        fragment_feat_dim=cfg.train.pharm_dim,
+        num_atom_classes=119,
+        num_fragment_classes=len(vocab_dict)
     ).to(devices)
 
     info("Setting up optimizers...")

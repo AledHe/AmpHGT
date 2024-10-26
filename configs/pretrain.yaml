@@ -1,6 +1,6 @@
 train:
   seed: 42
-  log_interval: 10  # Log every 100 steps
+  log_interval: 5  # Log every 100 steps
   cuda_deterministic: True
   mask_edge: False
   mask_atom: True
@@ -8,7 +8,7 @@ train:
   mask_edge_r: 0.1 # not used
   mask_atom_r: 0.8
   mask_fragment_r: 0.8
-  batch_size: 256
+  batch_size: 128
   hid_dim: 300
   act: "relu"
   depth: 3

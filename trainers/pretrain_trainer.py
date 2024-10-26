@@ -23,7 +23,10 @@ class Masking_Trainer(object):
                  decoder,  # PepMAE
                  optimizer,
                  device,
-                 outputdir):
+                 outputdir,
+                 reconstruction_weight=1.0,
+                 classification_weight=1.0
+                 ):
         self.cfg = cfg
         self.dataloaders = dataloaders
         self.device = device
@@ -32,75 +35,101 @@ class Masking_Trainer(object):
         self.encoder = encoder
         self.decoder = decoder
         self.optimizer = optimizer
-        self.criterion = PepMAELoss().to(device)
+        self.criterion = PepMAELoss(
+            reconstruction_weight=reconstruction_weight,
+            classification_weight=classification_weight
+        ).to(device)
 
         # Training state
         self.epoch = 0
         self.global_train_step = 0
-        self.best_loss = float('inf')
+        # self.best_loss = float('inf')
         self.patience_counter = 0
         self.monitor_steps = cfg.train.get('log_interval', 10)
 
-    def _prepare_batch_features(self, batch):
-        """Prepare original features before masking"""
-        return {
-            'atom_features': {
-                'atom_features': batch.nodes['a'].data['f'].clone(),
-                'junction_features': batch.nodes['a'].data['f_junc'].clone()
+        # metrics tracking
+        self.best_metrics = {
+            'reconstruction_loss': float('inf'),
+            'classification_loss': float('inf'),
+            'total_loss': float('inf')
+        }
+
+    def _prepare_batch_targets(self, batch, atom_mask, fragment_mask):
+        """
+        Prepare both reconstruction and classification targets
+        Now including masks to properly filter the targets
+        """
+        reconstruction_targets = {
+            'atom': {
+                'atom_features': batch.nodes['a'].data['f'][atom_mask],  # Only masked atoms
+                'junction_features': batch.nodes['a'].data['f_junc'][atom_mask]
             },
-            'fragment_features': {
-                'fragment_features': batch.nodes['p'].data['f'].clone(),
-                'junction_features': batch.nodes['p'].data['f_junc'].clone(),
-                'maccs': batch.nodes['p'].data['f'][:, :167].clone(),  # MACCS keys
-                'pharm': batch.nodes['p'].data['f'][:, 167:167+27].clone()  # Pharmacophore features
+            'fragment': {
+                'fragment_features': batch.nodes['p'].data['f'][fragment_mask],  # Only masked fragments
+                'junction_features': batch.nodes['p'].data['f_junc'][fragment_mask],
+                'maccs': batch.nodes['p'].data['f'][fragment_mask, :167],
+                'pharm': batch.nodes['p'].data['f'][fragment_mask, 167:167+27]
             }
         }
 
-    def _format_metrics(self, metrics: Dict[str, float], step: int) -> str:
+        classification_targets = {
+            'atom': {
+                'atomic_num': batch.nodes['a'].data['label'][atom_mask, 0],
+            },
+            'fragment': {
+                'vocab_idx': batch.nodes['p'].data['label'][fragment_mask]
+            }
+        }
+
+        return reconstruction_targets, classification_targets
+
+    def _log_training_progress(self, metrics: Dict[str, float], step: int) -> str:
         """Format metrics for logging"""
-        atom_metrics = {k: v for k, v in metrics.items() if 'atom' in k}
-        frag_metrics = {k: v for k, v in metrics.items() if 'fragment' in k}
+        log_str = f"Step {step} | "
+        log_str += f"Total Loss: {metrics['total_loss']:.4f} | "
+        log_str += f"Recon Loss: {metrics['reconstruction_loss']:.4f} | "
+        log_str += f"Class Loss: {metrics['classification_loss']:.4f} | "
         
-        avg_atom_loss = sum(v for k, v in atom_metrics.items() if 'loss' in k) / len(atom_metrics)
-        avg_frag_loss = sum(v for k, v in frag_metrics.items() if 'loss' in k) / len(frag_metrics)
+        # Add accuracies
+        for key, value in metrics.items():
+            if 'accuracy' in key:
+                log_str += f"{key}: {value:.2f} | "
         
-        return (f"Step {step} | "
-                f"Total Loss: {metrics['total_loss']:.4f} | "
-                f"Atom Loss: {avg_atom_loss:.4f} | "
-                f"Fragment Loss: {avg_frag_loss:.4f}")
+        info(log_str)
 
     def train_epoch(self):
         """Single training epoch with PepMAE"""
         self.encoder.train()
         self.decoder.train()
         
-        total_loss = 0
-        batch_metrics = defaultdict(float)
+        metrics_tracker = defaultdict(float)
         num_batches = 0
 
-        for step, (batch, _) in enumerate(self.dataloaders['train']):
+        for step, (batch, label) in enumerate(self.dataloaders['train']):
             batch = batch.to(self.device)
 
-            # Store original features and masks
-            original_features = self._prepare_batch_features(batch)
+            # Get masks
             atom_mask = batch.nodes['a'].data['mask']
             fragment_mask = batch.nodes['p'].data['mask']
+
+            # Prepare targets with masks
+            reconstruction_targets, classification_targets = self._prepare_batch_targets(
+                batch, atom_mask, fragment_mask
+            )
 
             # Forward pass through encoder (PharmHGT)
             atom_repr, fragment_repr = self.encoder(batch)
 
             # Forward pass through decoder (PepMAE)
-            atom_pred, fragment_pred = self.decoder(
+            reconstruction_pred, classification_pred = self.decoder(
                 atom_repr, fragment_repr,
                 atom_mask, fragment_mask
             )
 
             # Compute loss
-            loss, loss_metrics = self.criterion(
-                atom_pred,
-                {k: v[atom_mask] for k, v in original_features['atom_features'].items()},
-                fragment_pred,
-                {k: v[fragment_mask] for k, v in original_features['fragment_features'].items()}
+            loss, batch_metrics = self.criterion(
+                reconstruction_pred, reconstruction_targets,
+                classification_pred, classification_targets
             )
 
             # Backward pass
@@ -109,63 +138,21 @@ class Masking_Trainer(object):
             self.optimizer.step()
 
             # Update metrics
-            total_loss += loss.item()
-            for k, v in loss_metrics.items():
-                batch_metrics[k] += v
+            for name, value in batch_metrics.items():
+                metrics_tracker[name] += value
             num_batches += 1
 
             # Log progress
             self.global_train_step += 1
             if self.global_train_step % self.monitor_steps == 0:
-                current_metrics = {k: v/num_batches for k, v in batch_metrics.items()}
-                info(self._format_metrics(current_metrics, self.global_train_step))
+                current_metrics = {k: v/num_batches for k, v in metrics_tracker.items()}
+                self._log_training_progress(current_metrics, step)
 
-        # Compute epoch metrics
-        avg_metrics = {k: v/num_batches for k, v in batch_metrics.items()}
-        avg_metrics['total_loss'] = total_loss/num_batches
-
-        return avg_metrics
+        return {k: v/num_batches for k, v in metrics_tracker.items()}
 
     def validate_epoch(self):
         """Validation epoch"""
-        self.encoder.eval()
-        self.decoder.eval()
-        
-        batch_metrics = defaultdict(float)
-        num_batches = 0
-
-        with torch.no_grad():
-            for batch, _ in self.dataloaders['valid']:
-                batch = batch.to(self.device)
-
-                # Prepare features and masks
-                original_features = self._prepare_batch_features(batch)
-                atom_mask = batch.nodes['a'].data['mask']
-                fragment_mask = batch.nodes['p'].data['mask']
-
-                # Forward passes
-                atom_repr, fragment_repr = self.encoder(batch)
-                atom_pred, fragment_pred = self.decoder(
-                    atom_repr, fragment_repr,
-                    atom_mask, fragment_mask
-                )
-
-                # Compute metrics
-                _, metrics = self.criterion(
-                    atom_pred,
-                    {k: v[atom_mask] for k, v in original_features['atom_features'].items()},
-                    fragment_pred,
-                    {k: v[fragment_mask] for k, v in original_features['fragment_features'].items()}
-                )
-
-                # Update batch metrics
-                for k, v in metrics.items():
-                    batch_metrics[k] += v
-                num_batches += 1
-
-        # Average metrics
-        avg_metrics = {k: v/num_batches for k, v in batch_metrics.items()}
-        return avg_metrics
+        pass
 
     def run(self):
         """Complete training loop"""

@@ -1,0 +1,43 @@
+train:
+  seed: 42
+  log_interval: 10  # Log every 100 steps
+  cuda_deterministic: True
+  mask_edge: False
+  mask_atom: True
+  mask_fragment: True
+  mask_edge_r: 0.1 # not used
+  mask_atom_r: 0.8
+  mask_fragment_r: 0.8
+  batch_size: 256
+  hid_dim: 300
+  act: "relu"
+  depth: 3
+  num_task: 1
+  atom_dim: 42 # do not change
+  bond_dim: 14 # do not change
+  pharm_dim: 196 # do not change
+  reac_dim: 14
+  num_layer: 5
+  lr: 0.001
+  decay: 0
+  epochs: 10
+  frag_method: "FraSCESS"
+  train_tag: "s1_pretrain"
+  verify_splits: True
+
+data:
+  vocablist: "/home/ubuntu/project/amphgt_refactor/tokenizer/vocablist/vocab_1.json"
+  dataset_path: "/home/ubuntu/project/AmpHGT/datasets/pretrain/unlabelled_cleaned_sequences_mol"  # Path to the dataset
+  save_path: "/home/ubuntu/project/amphgt_refactor/datasets/split/pretrain"
+  num_workers: 8
+
+logger:
+  log: True
+  log_dir: "${output_dir}/${now:%m-%d-%H-%M}"
+  log_per_steps: 5
+  tracking_uri: "${output_dir}/mlflow_tracking"
+  mlflow_exp_name: "Pretraining_FraSCESS"
+
+mode:
+  nni: false  # If using NNI for hyperparameter tuning
+  ddp: false   # Distributed Data Parallel mode

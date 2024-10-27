@@ -287,6 +287,8 @@ class PharmHGT(nn.Module):
                                  nn.Linear(hid_dim,num_task)
                                 )
 
+        self.fusion = FeatureFusionGate(hidden_dim=hid_dim)
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -323,17 +325,69 @@ class PharmHGT(nn.Module):
         # embed_aug = self.readout_attn(bg,'aug')
         # embed = torch.cat([embed_f,embed_aug],1)
         # out = self.out(embed)
-        embed_f_a = bg.nodes['a'].data['f_h']
-        embed_f_p = bg.nodes['p'].data['f_h']
-        embed_junc_h_a = bg.nodes['a'].data['f_junc_h']
-        embed_junc_h_p = bg.nodes['p'].data['f_junc_h']
+        # embed_f_a = bg.nodes['a'].data['f_h']
+        # embed_f_p = bg.nodes['p'].data['f_h']
+        # embed_junc_h_a = bg.nodes['a'].data['f_junc_h']
+        # embed_junc_h_p = bg.nodes['p'].data['f_junc_h']
         # embed_aug_a = bg.nodes['a'].data['f_aug']
         # embed_aug_p = bg.nodes['p'].data['f_aug']
         # embed_junc_aug_a = bg.nodes['a'].data['f_junc_aug']
         # embed_junc_aug_p = bg.nodes['p'].data['f_junc_aug']
 
         
-        embed_a = torch.mean(torch.stack([embed_f_a,embed_junc_h_a],dim=1),dim=1)
-        embed_p = torch.mean(torch.stack([embed_f_p,embed_junc_h_p],dim=1),dim=1)
+        # embed_a = torch.mean(torch.stack([embed_f_a,embed_junc_h_a],dim=1),dim=1)
+        # embed_p = torch.mean(torch.stack([embed_f_p,embed_junc_h_p],dim=1),dim=1)
         # embed_p = torch.mean(torch.stack([embed_f_p,embed_junc_h_p,embed_aug_p,embed_junc_aug_p],dim=1),dim=1)
-        return embed_a,embed_f_p
+
+        embed_a,embed_p = self.fusion(bg)
+
+        return embed_a,embed_p
+    
+class FeatureFusionGate(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        # Linear layer to compute gates
+        self.gate_linear = nn.Linear(2 * hidden_dim, hidden_dim)
+        self.activation = nn.Sigmoid()  # For gating, sigmoid activation.
+        
+    def _process_node_type(self, embed_f, embed_junc):
+        """
+        Args:
+            embed_f: Tensor of shape [total_nodes, hidden_dim]
+            embed_junc: Tensor of shape [total_nodes, hidden_dim]
+        Returns:
+            fused_embed: Tensor of shape [total_nodes, hidden_dim]
+        """
+        # DGL已经保证了图的边界，我们可以直接处理所有节点
+
+        # Concatenate embeddings
+        concat_embed = torch.cat([embed_f, embed_junc], dim=1)  # [total_nodes, 2 * hidden_dim]
+        
+        # Compute gates
+        gates = self.activation(self.gate_linear(concat_embed))  # [total_nodes, hidden_dim]
+        
+        # Fuse embeddings using gates
+        return gates * embed_f + (1 - gates) * embed_junc  # [total_nodes, hidden_dim]
+        
+    def forward(self, graph):
+        """
+        Args:
+            graph: DGL batched graph
+        Returns:
+            atom_repr: [num_atoms, hidden_dim]
+            frag_repr: [num_fragments, hidden_dim]
+        """
+        # Process atoms
+        atom_repr = self._process_node_type(
+            graph.nodes['a'].data['f_h'],
+            graph.nodes['a'].data['f_junc_h']
+        )
+        
+        # Process fragments
+        frag_repr = self._process_node_type(
+            graph.nodes['p'].data['f_h'],
+            graph.nodes['p'].data['f_junc_h']
+        )
+        
+        return atom_repr, frag_repr

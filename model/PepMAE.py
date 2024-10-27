@@ -4,9 +4,13 @@ Customized prediction head, changed name to PepMAE.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Dict, Tuple
 
 from utils.features import ATOM_FEATURES
+
+#TODO: GradNorm for combined loss.
+#TODO: Edge feature process.
 
 class PepMAE(nn.Module):
     """
@@ -108,10 +112,12 @@ class PepMAELoss(nn.Module):
     """
     def __init__(self, 
                  reconstruction_weight: float = 1.0,
-                 classification_weight: float = 1.0):
+                 classification_weight: float = 1.0,
+                 alpha: float = 1.0):
         super().__init__()
         self.reconstruction_weight = reconstruction_weight
         self.classification_weight = classification_weight
+        self.alpha = alpha
 
         # reconstruction losses
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
@@ -119,6 +125,13 @@ class PepMAELoss(nn.Module):
 
         # classification losses
         self.ce = nn.CrossEntropyLoss()
+
+    def sce_loss(self, x, y):
+        """Scaled Cosine Error (SCE) loss implementation from GraphMAE"""
+        x = F.normalize(x, p=2, dim=-1)
+        y = F.normalize(y, p=2, dim=-1)
+        loss = (1 - (x * y).sum(dim=-1)).pow_(self.alpha)
+        return loss.mean()
         
     def forward(self,
                 reconstruction_pred: Dict,
@@ -135,10 +148,12 @@ class PepMAELoss(nn.Module):
         for feat_type in ['atom', 'fragment']:
             for feat_name, pred in reconstruction_pred[feat_type].items():
                 true = reconstruction_true[feat_type][feat_name]
-                if feat_name in ['maccs', 'pharm']:
-                    loss = self.bce(pred, true).mean()
-                else:
-                    loss = self.mse(pred, true).mean()
+                if self.alpha:
+                    loss = self.sce_loss(pred, true)
+                # if feat_name in ['maccs', 'pharm']:
+                #     loss = self.bce(pred, true).mean()
+                # else:
+                #     loss = self.mse(pred, true).mean()
                 losses[f'{feat_type}_{feat_name}_recon_loss'] = loss
                 recon_loss += loss
         

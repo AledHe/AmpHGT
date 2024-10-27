@@ -34,18 +34,22 @@ Fragments:
 直接片段类型分类（从词汇表中预测哪个片段）
 
 PepMAE：
-重建了一个更加强大的预测体系，PepMAE，包含了对于特征的重建。详见代码。
-#TODO: 下列在PepMAE中被丢弃了，应该重新实施。目前是重建了特征预测。
-对原子的序数，带点，质量，芳香性等综合进行预测。
-对于fragments，特征重建（预测片段属性和特征），我们也需要预测fragments的分类。#TODO:加上这个任务。
+重建了一个更加强大的预测体系，PepMAE，包含了对于特征的重建，对原子的序数的预测，预测fragments的分类。详见代码。
+重建特征的代码与方法编写的正确吗？
+鉴于目前的PharmHGT结构与返回特征表示，我们确实需要PepMAE重建junction_features吗？
+我认为我们应该仔细思考PharmHGT的返回格式，并且基于新的返回格式思考重建特征的细节。（是否不应该重建junction_features）
+需要参考新的特征表示方法。
+
+PharmHGT：
+目前的深度够了吗？结构足够好吗？
 
 目前的训练方法任然不完善。试着运行代码发现了如下问题：
-1. VRAM会逐渐累计直到溢出。
+1. VRAM会逐渐累计直到溢出。（似乎解决了）
 2. Validation epoch还没有进行过测试。
 3. 预测方法可能还需要调整。
 4. 使用MLflow保存模型，目前抛弃了这个方式。
 
-记录于 2024/10/24
+记录于 2024/10/27
 """
 
 @lcfig(config_path = 'configs/pretrain.yaml', output_dir = "out_pretrain")

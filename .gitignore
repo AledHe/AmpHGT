@@ -1,3 +1,8 @@
 out_pretrain/
+tmp/
+MacFrag/
+propy/
 *.pyc
 __pycache__/
+datasets/
+*.txt

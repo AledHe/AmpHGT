@@ -13,7 +13,6 @@ import torch
 from model.PepMAE import PepMAELoss
 from utils.std_logger import info
 from collections import defaultdict
-from pathlib import Path
 
 class Masking_Trainer(object):
     def __init__(self,
@@ -25,7 +24,7 @@ class Masking_Trainer(object):
                  device,
                  outputdir,
                  reconstruction_weight=1.0,
-                 classification_weight=1.0
+                 classification_weight=0.75
                  ):
         self.cfg = cfg
         self.dataloaders = dataloaders
@@ -43,59 +42,42 @@ class Masking_Trainer(object):
         # Training state
         self.epoch = 0
         self.global_train_step = 0
-        # self.best_loss = float('inf')
+        self.best_loss = float('inf')
         self.patience_counter = 0
         self.monitor_steps = cfg.train.get('log_interval', 10)
 
-        # metrics tracking
-        self.best_metrics = {
-            'reconstruction_loss': float('inf'),
-            'classification_loss': float('inf'),
-            'total_loss': float('inf')
-        }
+        self.early_stop = False
+        self.val_interval = cfg.train.val_interval
 
-    def _prepare_batch_targets(self, batch, atom_mask, fragment_mask):
-        """
-        Prepare both reconstruction and classification targets
-        Now including masks to properly filter the targets
-        """
-        reconstruction_targets = {
-            'atom': {
-                'atom_features': batch.nodes['a'].data['f'][atom_mask],  # Only masked atoms
-                'junction_features': batch.nodes['a'].data['f_junc'][atom_mask]
-            },
-            'fragment': {
-                'fragment_features': batch.nodes['p'].data['f'][fragment_mask],  # Only masked fragments
-                'junction_features': batch.nodes['p'].data['f_junc'][fragment_mask],
-                'maccs': batch.nodes['p'].data['f'][fragment_mask, :167],
-                'pharm': batch.nodes['p'].data['f'][fragment_mask, 167:167+27]
-            }
-        }
-
-        classification_targets = {
-            'atom': {
-                'atomic_num': batch.nodes['a'].data['label'][atom_mask, 0],
-            },
-            'fragment': {
-                'vocab_idx': batch.nodes['p'].data['label'][fragment_mask]
-            }
-        }
-
-        return reconstruction_targets, classification_targets
-
-    def _log_training_progress(self, metrics: Dict[str, float], step: int) -> str:
+    def _log_progress(self, metrics: Dict[str, float], step: int, stage: str) -> str:
         """Format metrics for logging"""
-        log_str = f"Step {step} | "
-        log_str += f"Total Loss: {metrics['total_loss']:.4f} | "
-        log_str += f"Recon Loss: {metrics['reconstruction_loss']:.4f} | "
-        log_str += f"Class Loss: {metrics['classification_loss']:.4f} | "
+        log_str = f"{stage} Step {step} | "
+        log_str += f"Total Loss: {metrics['loss']:.4f} | "
+        log_str += f"Recon Loss: {metrics['recon_loss']:.4f} | "
+        log_str += f"Class Loss: {metrics['class_loss']:.4f} | "
         
         # Add accuracies
         for key, value in metrics.items():
-            if 'accuracy' in key:
+            if 'acc' in key:
                 log_str += f"{key}: {value:.2f} | "
         
         info(log_str)
+
+    def prepare_mask_targets(self, batch, atom_repr, fragment_repr):
+        # get masked batch
+        atom_mask = atom_repr[batch.nodes['a'].data['mask'] == True]
+        fragment_mask = fragment_repr[batch.nodes['p'].data['mask'] == True]
+        # get target
+        feature_targets = {
+            "atom": batch.nodes['a'].data['f_unmasked'][batch.nodes['a'].data['mask'] == True],
+            "fragment": batch.nodes['p'].data['f_unmasked'][batch.nodes['p'].data['mask'] == True]
+        }
+        class_targets = {
+            "atom": batch.nodes['a'].data['label'][batch.nodes['a'].data['mask'] == True],
+            "fragment": batch.nodes['p'].data['label'][batch.nodes['p'].data['mask'] == True]
+        }
+
+        return atom_mask, fragment_mask, feature_targets, class_targets
 
     def train_epoch(self):
         """Single training epoch with PepMAE"""
@@ -106,30 +88,40 @@ class Masking_Trainer(object):
         num_batches = 0
 
         for step, (batch, label) in enumerate(self.dataloaders['train']):
+            if self.early_stop:
+                # stop training if early stop triggered
+                break
+            # print(step, (batch, label))
+
             batch = batch.to(self.device)
+            label = label.to(self.device) # -1, 0, 1
 
-            # Get masks
-            atom_mask = batch.nodes['a'].data['mask']
-            fragment_mask = batch.nodes['p'].data['mask']
+            # Forward pass through encoder (PharmHGT), returns stacked _h and _junc_h.
+            atom_repr, fragment_repr, bg = self.encoder(batch)
+            batch = bg
 
-            # Prepare targets with masks
-            reconstruction_targets, classification_targets = self._prepare_batch_targets(
+            # prepare mask and targets for MLP decoder. other decoder won't use this, return and pass for unified interface.
+            # while the targets are used for all encoders.
+            atom_mask, fragment_mask, feature_targets, class_targets = self.prepare_mask_targets(
+                batch, atom_repr, fragment_repr
+            )
+
+            # Forward pass through decoder (PepMAE)
+            feature_decodes, class_decodes = self.decoder(
                 batch, atom_mask, fragment_mask
             )
 
-            # Forward pass through encoder (PharmHGT)
-            atom_repr, fragment_repr = self.encoder(batch)
-
-            # Forward pass through decoder (PepMAE)
-            reconstruction_pred, classification_pred = self.decoder(
-                atom_repr, fragment_repr,
-                atom_mask, fragment_mask
-            )
-
             # Compute loss
+            # batch_metrics = {
+            #     "loss": total_loss.item(),
+            #     "recon_loss": recon_loss.item(),
+            #     "class_loss": class_loss.item(),
+            #     "atom_acc": atom_acc,
+            #     "fragment_acc": frag_acc
+            # }
             loss, batch_metrics = self.criterion(
-                reconstruction_pred, reconstruction_targets,
-                classification_pred, classification_targets
+                feature_decodes, feature_targets,
+                class_decodes, class_targets
             )
 
             # Backward pass
@@ -146,55 +138,150 @@ class Masking_Trainer(object):
             self.global_train_step += 1
             if self.global_train_step % self.monitor_steps == 0:
                 current_metrics = {k: v/num_batches for k, v in metrics_tracker.items()}
-                self._log_training_progress(current_metrics, step)
+                self._log_progress(current_metrics, step, "train")
+
+            # -----------------------------
+            # every val_interval steps, run validation
+            if self.global_train_step % self.val_interval == 0:
+                self.in_train_validate()
+                # if early stop
+                if self.early_stop:
+                    break
 
         return {k: v/num_batches for k, v in metrics_tracker.items()}
+    
+    def in_train_validate(self):
+        """
+        触发一次验证，得到 val_metrics 并与 best_loss 比较，若更好则保存模型。
+        如果 patience 超出限制，则 early_stop = True.
+        """
+        val_metrics = self.eov_epoch('valid')
+        
+        # log validation metrics
+        if self.cfg.logger.log:
+            for name, value in val_metrics.items():
+                mlflow.log_metric(f"val_{name}", value, step=self.global_train_step)
 
-    def validate_epoch(self):
-        """Validation epoch"""
-        pass
+        # early-stopping & checkpoint
+        if val_metrics['loss'] < self.best_loss:
+            self.best_loss = val_metrics['loss']
+            self.patience_counter = 0
+            self._save_checkpoint(
+                self.epoch,
+                val_metrics,
+                step_suffix=f"step_{self.global_train_step}"
+            )
+        else:
+            self.patience_counter += 1
+            if self.patience_counter >= self.cfg.train.patience:
+                info(f"Early stopping triggered at step {self.global_train_step}.")
+                self.early_stop = True
+
+    def eov_epoch(self, stage: str):
+        """evaluation or validation epoch"""
+        self.encoder.eval()
+        self.decoder.eval()
+        
+        metrics_tracker = defaultdict(float)
+        num_batches = 0
+
+        with torch.no_grad():
+            for step, (batch, label) in enumerate(self.dataloaders[stage]):
+                batch = batch.to(self.device)
+                label = label.to(self.device)
+                
+                # Forward pass through encoder (PharmHGT)
+                atom_repr, fragment_repr, bg = self.encoder(batch)
+                batch = bg
+                
+                atom_mask, fragment_mask, feature_targets, class_targets = self.prepare_mask_targets(
+                    batch, atom_repr, fragment_repr
+                )
+
+                # Forward pass through decoder (PepMAE)
+                feature_decodes, class_decodes = self.decoder(
+                    batch, atom_mask, fragment_mask
+                )
+
+                # Compute loss
+                loss, batch_metrics = self.criterion(
+                    feature_decodes, feature_targets,
+                    class_decodes, class_targets
+                )
+
+                # Update metrics
+                for name, value in batch_metrics.items():
+                    metrics_tracker[name] += value
+                num_batches += 1
+
+        if num_batches > 0:
+            for name in metrics_tracker:
+                metrics_tracker[name] /= num_batches
+        
+        return metrics_tracker
 
     def run(self):
         """Complete training loop"""
         for epoch in range(self.cfg.train.epochs):
-            # Training
-            train_metrics = self.train_epoch()
-            
-            # Validation
-            val_metrics = self.validate_epoch()
+            if self.early_stop:
+                break
 
-            # Logging
-            self._log_epoch_metrics(train_metrics, val_metrics, epoch)
+            # training
+            train_metrics = self.train_epoch()
+
+            self._log_epoch_metrics(train_metrics=train_metrics, val_metrics=None, test_metrics=None, epoch=epoch)
+
+            if self.early_stop:
+                break
+            
+            # validation
+            val_metrics = self.eov_epoch(stage='valid')
+
+            self._log_epoch_metrics(train_metrics=None, val_metrics=val_metrics, test_metrics=None, epoch=epoch)
 
             # Model selection and early stopping
-            if val_metrics['total_loss'] < self.best_loss:
-                self.best_loss = val_metrics['total_loss']
+            if val_metrics['loss'] < self.best_loss:
+                self.best_loss = val_metrics['loss']
                 self.patience_counter = 0
-                self._save_checkpoint(epoch, val_metrics)
+                self._save_checkpoint(epoch, val_metrics, "best")
             else:
                 self.patience_counter += 1
                 if self.patience_counter >= self.cfg.train.patience:
-                    info(f"Early stopping triggered after {epoch + 1} epochs")
+                    info(f"Early stopping triggered after epoch {epoch + 1}.")
                     break
+        
+        # test
+        test_metrics = self.eov_epoch(stage='test')
+        self._log_epoch_metrics(train_metrics=None, val_metrics=None, test_metrics=test_metrics, epoch=epoch)
 
-    def _log_epoch_metrics(self, train_metrics, val_metrics, epoch):
+    def _log_epoch_metrics(self, train_metrics, val_metrics, test_metrics, epoch):
         """Log metrics for both training and validation"""
-        info(f"\nEpoch {epoch + 1}")
-        info("Training Metrics:")
-        for name, value in train_metrics.items():
-            info(f"{name}: {value:.4f}")
-            if self.cfg.logger.log:
-                mlflow.log_metric(f"train_{name}", value, step=epoch)
+        info(f"Epoch {epoch + 1}")
+        if train_metrics:
+            info("Training Metrics:")
+            for name, value in train_metrics.items():
+                info(f"{name}: {value:.4f}")
+                if self.cfg.logger.log:
+                    mlflow.log_metric(f"train_{name}", value, step=epoch)
+        elif val_metrics:
+            info("Validation Metrics:")
+            for name, value in val_metrics.items():
+                info(f"{name}: {value:.4f}")
+                if self.cfg.logger.log:
+                    mlflow.log_metric(f"val_{name}", value, step=epoch)
+        elif test_metrics:
+            info("Test Metrics:")
+            for name, value in test_metrics.items():
+                info(f"{name}: {value:.4f}")
+                if self.cfg.logger.log:
+                    mlflow.log_metric(f"test_{name}", value, step=epoch)
 
-        info("\nValidation Metrics:")
-        for name, value in val_metrics.items():
-            info(f"{name}: {value:.4f}")
-            if self.cfg.logger.log:
-                mlflow.log_metric(f"val_{name}", value, step=epoch)
-
-    def _save_checkpoint(self, epoch, metrics):
+    def _save_checkpoint(self, epoch, metrics, step_suffix=""):
         """Save model checkpoint"""
-        checkpoint_dir = os.path.join(self.outputdir, f"checkpoint_epoch_{epoch}")
+        checkpoint_dir = os.path.join(
+            self.outputdir, 
+            f"checkpoint_epoch_{epoch}" + (f"_{step_suffix}" if step_suffix else "")
+        )
         os.makedirs(checkpoint_dir, exist_ok=True)
         
         torch.save({
@@ -207,3 +294,5 @@ class Masking_Trainer(object):
         
         with open(os.path.join(checkpoint_dir, "metrics.json"), "w") as f:
             json.dump(metrics, f)
+
+        info(f"Checkpoint saved at {checkpoint_dir}.")

@@ -2,20 +2,140 @@
 Customized prediction head, changed name to PepMAE.
 """
 
+import dgl
+import dgl.nn.pytorch as dglnn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple
+from typing import Dict
 
-from utils.features import ATOM_FEATURES
+class MLPDecoder(nn.Module):
+    def __init__(self,
+                 hidden_dim: int,
+                 atom_feat_dim: int,
+                 fragment_feat_dim: int,
+                 num_atom_classes: int,
+                 num_fragment_classes: int
+                 ):
+        super().__init__()
+        self.atom_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, atom_feat_dim),
+            nn.ReLU()
+        )
+        self.fragment_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, fragment_feat_dim),
+            nn.ReLU()
+        )
+        self.atom_classifier = nn.Linear(hidden_dim, num_atom_classes)
+        self.fragment_classifier = nn.Linear(hidden_dim, num_fragment_classes)
 
-#TODO: GradNorm for combined loss.
-#TODO: Edge feature process.
+    def forward(self,
+                bg, 
+                atom_mask: torch.Tensor,
+                fragment_mask: torch.Tensor
+                ):
+        atom_decoded = self.atom_decoder(atom_mask)
+        fragment_decoded = self.fragment_decoder(fragment_mask)
+
+        atom_class = self.atom_classifier(atom_mask)
+        fragment_class = self.fragment_classifier(fragment_mask)
+
+        feature_decodes = {"atom": atom_decoded, "fragment": fragment_decoded}
+        class_decodes = {"atom": atom_class, "fragment": fragment_class}
+
+        return feature_decodes, class_decodes
+
+class HeteroConv(nn.Module):
+    def __init__(self,
+                 hidden_dim: int,
+                 atom_feat_dim: int,
+                 fragment_feat_dim: int,
+                 num_atom_classes: int,
+                 num_fragment_classes: int,
+                 num_layers = 2
+                 ):
+        super().__init__()
+        # 1) Define heterogeneous convolution. For each edge type, give a GraphConv.
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.num_layers = num_layers
+
+        for _ in range(num_layers):
+            conv = dglnn.HeteroGraphConv({
+                ('a', 'b', 'a'): dglnn.GraphConv(hidden_dim, hidden_dim),
+                ('p', 'r', 'p'): dglnn.GraphConv(hidden_dim, hidden_dim),
+                ('a', 'j', 'p'): dglnn.GraphConv(hidden_dim, hidden_dim),
+                ('p', 'j', 'a'): dglnn.GraphConv(hidden_dim, hidden_dim)
+            }, aggregate='mean')  # or 'sum', 'max', etc.
+            self.convs.append(conv)
+
+            # Layer Normalization
+            self.norms.append(nn.ModuleDict({
+                'a': nn.LayerNorm(hidden_dim),
+                'p': nn.LayerNorm(hidden_dim)
+            }))
+
+        # 2) decode layer
+        self.atom_feat_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, atom_feat_dim)
+        )
+        self.frag_feat_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, fragment_feat_dim)
+        )
+
+        # 3) classification layer
+        self.atom_classifier = nn.Linear(hidden_dim, num_atom_classes)
+        self.frag_classifier = nn.Linear(hidden_dim, num_fragment_classes)
+
+    def forward(self, 
+                bg: dgl.DGLHeteroGraph,
+                ):
+        """
+        param:
+        bg: current batch of graphs
+        """
+        # 1) Heterogeneous Convolution
+        h = {
+            'a': bg.nodes['a'].data['f_h'],
+            'p': bg.nodes['p'].data['f_h']
+        }
+
+        for i in range(self.num_layers):
+            # message passing
+            h_update = self.convs[i](bg, h)
+            
+            # residual connection + layer normalization
+            h = {
+                'a': self.norms[i]['a'](h['a'] + F.relu(h_update['a'])),
+                'p': self.norms[i]['p'](h['p'] + F.relu(h_update['p']))
+            }
+
+        feature_decodes = {
+            'atom': self.atom_feat_decoder(h['a'][bg.nodes['a'].data['mask'] == True]),
+            'fragment': self.frag_feat_decoder(h['p'][bg.nodes['p'].data['mask'] == True])
+        }
+        
+        class_decodes = {
+            'atom': self.atom_classifier(h['a'][bg.nodes['a'].data['mask'] == True]),
+            'fragment': self.frag_classifier(h['p'][bg.nodes['p'].data['mask'] == True])
+        }
+
+        return feature_decodes, class_decodes
+
+class HeteroAttNet(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        pass
 
 class PepMAE(nn.Module):
     """
-    Peptide Masked Autoencoder for heterogeneous molecular graphs.
-    Designed to work with PharmHGT and existing peptide data structure.
+    Controller for different decoders.
     """
     def __init__(self, 
                  hidden_dim: int,
@@ -23,88 +143,35 @@ class PepMAE(nn.Module):
                  fragment_feat_dim: int,
                  num_atom_classes: int,   # For atom classification
                  num_fragment_classes: int, # From vocab size
+                 decoder_type = "MLP"
                  ):
         super().__init__()
-        
-        # Atom reconstruction components
-        self.atom_decoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU()
-        )
-        
-        self.atom_heads = nn.ModuleDict({
-            'atom_features': nn.Linear(hidden_dim // 2, atom_feat_dim),
-            'junction_features': nn.Linear(hidden_dim // 2, atom_feat_dim + fragment_feat_dim)
-        })
-        
-        # Fragment reconstruction components
-        self.fragment_decoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU()
-        )
-        
-        self.fragment_heads = nn.ModuleDict({
-            'fragment_features': nn.Linear(hidden_dim // 2, fragment_feat_dim),
-            'junction_features': nn.Linear(hidden_dim // 2, atom_feat_dim + fragment_feat_dim),
-            'maccs': nn.Linear(hidden_dim // 2, 167),  # MACCS keys dimension
-            'pharm': nn.Linear(hidden_dim // 2, 27)    # Pharmacophore features dimension
-        })
+        self.hidden_dim = hidden_dim
+        self.atom_feat_dim = atom_feat_dim
+        self.fragment_feat_dim = fragment_feat_dim
+        self.num_atom_classes = num_atom_classes
+        self.num_fragment_classes = num_fragment_classes
+        self.decoder_type = decoder_type
 
-        # Classification components
-        self.atom_classifier = nn.ModuleDict({
-            'atomic_num': nn.Linear(hidden_dim, num_atom_classes),
-        })
-        
-        self.fragment_classifier = nn.Linear(hidden_dim, num_fragment_classes)
+        if decoder_type == "MLP":
+            self.decoder = MLPDecoder(hidden_dim, atom_feat_dim, fragment_feat_dim, num_atom_classes, num_fragment_classes)
+        elif decoder_type == "HGC":
+            self.decoder = HeteroConv(hidden_dim, atom_feat_dim, fragment_feat_dim, num_atom_classes, num_fragment_classes)
+        elif decoder_type == "HAN":
+            # not implemented
+            self.decoder = HeteroAttNet(hidden_dim, atom_feat_dim, fragment_feat_dim, num_atom_classes, num_fragment_classes)
+        else:
+            raise ValueError(f"Decoder type {decoder_type} not supported.")
 
-    def forward(self, 
-                atom_repr: torch.Tensor,
-                fragment_repr: torch.Tensor,
+    def forward(self,
+                bg: dgl.DGLHeteroGraph,
                 atom_mask: torch.Tensor,
                 fragment_mask: torch.Tensor
-                ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """
-        Forward pass compatible with existing PharmHGT output format
-        """
-        # Get masked node representations
-        masked_atom_repr = atom_repr[atom_mask]
-        masked_frag_repr = fragment_repr[fragment_mask]
-        
-        # 1. Feature Reconstruction
-        # Decode atom features
-        atom_decoded = self.atom_decoder(masked_atom_repr)
-        
-        # Decode fragment features
-        frag_decoded = self.fragment_decoder(masked_frag_repr)
-
-        reconstruction_predictions = {
-            'atom': {
-                name: head(atom_decoded)
-                for name, head in self.atom_heads.items()
-            },
-            'fragment': {
-                name: head(frag_decoded)
-                for name, head in self.fragment_heads.items()
-            }
-        }
-        
-        # 2. Classification
-        classification_predictions = {
-            'atom': {
-                'atomic_num': self.atom_classifier['atomic_num'](masked_atom_repr)
-            },
-            'fragment': {
-                'vocab_idx': self.fragment_classifier(masked_frag_repr)
-            }
-        }
-        
-        return reconstruction_predictions, classification_predictions
+                ):
+        if self.decoder_type == "MLP":
+            return self.decoder(bg, atom_mask, fragment_mask)
+        elif self.decoder_type == "HGC":
+            return self.decoder(bg)
 
 class PepMAELoss(nn.Module):
     """
@@ -113,15 +180,14 @@ class PepMAELoss(nn.Module):
     def __init__(self, 
                  reconstruction_weight: float = 1.0,
                  classification_weight: float = 1.0,
-                 alpha: float = 1.0):
+                 alpha: float = 1.0, 
+                 ):
         super().__init__()
         self.reconstruction_weight = reconstruction_weight
         self.classification_weight = classification_weight
         self.alpha = alpha
 
-        # reconstruction losses
-        self.bce = nn.BCEWithLogitsLoss(reduction='none')
-        self.mse = nn.MSELoss(reduction='none')
+        self.mse = nn.MSELoss()
 
         # classification losses
         self.ce = nn.CrossEntropyLoss()
@@ -132,63 +198,51 @@ class PepMAELoss(nn.Module):
         y = F.normalize(y, p=2, dim=-1)
         loss = (1 - (x * y).sum(dim=-1)).pow_(self.alpha)
         return loss.mean()
+    
+    def compute_accuracy(self, pred, target):
+        return float(torch.sum(torch.max(pred.detach(), dim = 1)[1] == target).cpu().item())/len(pred)
+    
+    def loss(self,
+                feature_decodes: Dict[str, torch.Tensor],
+                feature_targets: Dict[str, torch.Tensor],
+                class_decodes: Dict[str, torch.Tensor],
+                class_targets: Dict[str, torch.Tensor]
+                ):
+        # Reconstruction loss
+        # print(feature_decodes["atom"].shape, feature_targets["atom"].shape)
+        # print(feature_decodes["fragment"].shape, feature_targets["fragment"].shape)
+        atom_recon_loss = self.sce_loss(feature_decodes["atom"], feature_targets["atom"])
+        frag_recon_loss = self.sce_loss(feature_decodes["fragment"], feature_targets["fragment"])
+        recon_loss = atom_recon_loss + frag_recon_loss
+
+        # Classification loss
+        # print(class_decodes["atom"], class_targets["atom"])
+        # print(class_decodes["atom"].shape, class_targets["atom"].shape)
+        # print(class_decodes["fragment"].shape, class_targets["fragment"].shape)
+        atom_class_loss = self.ce(class_decodes["atom"].double(), class_targets["atom"][:, 0])
+        frag_class_loss = self.ce(class_decodes["fragment"].double(), class_targets["fragment"])
+        class_loss = atom_class_loss + frag_class_loss
+
+        total_loss = self.reconstruction_weight * recon_loss \
+                   + self.classification_weight * class_loss
         
+        atom_acc = self.compute_accuracy(class_decodes["atom"], class_targets["atom"][:, 0])
+        frag_acc = self.compute_accuracy(class_decodes["fragment"], class_targets["fragment"])
+
+        batch_metrics = {
+            "loss": total_loss.item(),
+            "recon_loss": recon_loss.item(),
+            "class_loss": class_loss.item(),
+            "atom_acc": atom_acc,
+            "fragment_acc": frag_acc
+        }
+
+        return total_loss, batch_metrics
+    
     def forward(self,
-                reconstruction_pred: Dict,
-                reconstruction_true: Dict,
-                classification_pred: Dict,
-                classification_true: Dict
-                ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        
-        losses = {}
-        metrics = {}
-        
-        # 1. Reconstruction losses
-        recon_loss = 0.0
-        for feat_type in ['atom', 'fragment']:
-            for feat_name, pred in reconstruction_pred[feat_type].items():
-                true = reconstruction_true[feat_type][feat_name]
-                if self.alpha:
-                    loss = self.sce_loss(pred, true)
-                # if feat_name in ['maccs', 'pharm']:
-                #     loss = self.bce(pred, true).mean()
-                # else:
-                #     loss = self.mse(pred, true).mean()
-                losses[f'{feat_type}_{feat_name}_recon_loss'] = loss
-                recon_loss += loss
-        
-        # 2. Classification losses
-        class_loss = 0.0
-        # Atom number classification
-        atom_num_pred = classification_pred['atom']['atomic_num']
-        atom_num_true = classification_true['atom']['atomic_num']
-        atom_num_loss = self.ce(atom_num_pred, atom_num_true)
-        losses['atom_num_class_loss'] = atom_num_loss
-        
-        # Fragment vocabulary classification
-        frag_vocab_pred = classification_pred['fragment']['vocab_idx']
-        frag_vocab_true = classification_true['fragment']['vocab_idx']
-        frag_vocab_loss = self.ce(frag_vocab_pred, frag_vocab_true)
-        losses['fragment_vocab_class_loss'] = frag_vocab_loss
-        
-        class_loss = atom_num_loss + frag_vocab_loss
-        
-        # Calculate accuracies
-        atom_num_acc = (atom_num_pred.argmax(dim=1) == atom_num_true).float().mean()
-        frag_vocab_acc = (frag_vocab_pred.argmax(dim=1) == frag_vocab_true).float().mean()
-        
-        metrics['atom_num_accuracy'] = atom_num_acc.item()
-        metrics['fragment_vocab_accuracy'] = frag_vocab_acc.item()
-        
-        # Combine losses with weights
-        total_loss = (self.reconstruction_weight * recon_loss + 
-                     self.classification_weight * class_loss)
-        
-        losses['reconstruction_loss'] = recon_loss.item()
-        losses['classification_loss'] = class_loss.item()
-        losses['total_loss'] = total_loss.item()
-        
-        # Combine all metrics
-        metrics.update(losses)
-        
-        return total_loss, metrics
+                feature_decodes: Dict[str, torch.Tensor],
+                feature_targets: Dict[str, torch.Tensor],
+                class_decodes: Dict[str, torch.Tensor],
+                class_targets: Dict[str, torch.Tensor]
+                ):
+        return self.loss(feature_decodes, feature_targets, class_decodes, class_targets)

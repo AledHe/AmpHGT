@@ -8,6 +8,8 @@ import copy
 
 import math
 from model.utils import get_func
+from utils.std_logger import info
+from .readouts import GlobalPooling, HierAttnReadout, HeteroConvReadout
 
 # dgl graph utils
 def reverse_edge(tensor):
@@ -254,7 +256,7 @@ class MVMP(nn.Module):
             )
 
 class PharmHGT(nn.Module):
-    def __init__(self, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, num_task=1):
+    def __init__(self, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim):
         super(PharmHGT,self).__init__()
         # hid_dim = args['hid_dim']
         self.act = get_func(act)
@@ -272,22 +274,10 @@ class PharmHGT(nn.Module):
 
         ## define the view during massage passing
         # self.mp = MVMP(msg_func=add_attn,hid_dim=hid_dim,depth=self.depth,view='aj',suffix='h',act=self.act)
+        # ('a','b','a'), ('p','r','p'), ('a','j','p'), ('p','j','a') are in apj view.
+        # so there might no need to run 'a', 'ap' in advance.
         self.mp = MVMP(msg_func=add_attn,hid_dim=hid_dim,depth=self.depth,view='apj',suffix='h',act=self.act)
         # self.mp_junc = MVMP(msg_func=add_attn,hid_dim=hid_dim,depth=self.depth,view='apj',suffix='j',act=self.act)
-        
-        ## readout
-        self.readout = Node_GRU(hid_dim)
-        self.readout_attn = Node_GRU(hid_dim)
-
-        ## predict
-        self.out = nn.Sequential(nn.Linear(4*hid_dim,hid_dim),
-                                 self.act,
-                                 nn.Linear(hid_dim,hid_dim),
-                                 self.act,
-                                 nn.Linear(hid_dim,num_task)
-                                )
-
-        self.fusion = FeatureFusionGate(hidden_dim=hid_dim)
 
         self.initialize_weights()
 
@@ -312,82 +302,298 @@ class PharmHGT(nn.Module):
         bg.nodes['a'].data['f_junc'] = self.act(self.w_junc(bg.nodes['a'].data['f_junc']))
         bg.nodes['p'].data['f_junc'] = self.act(self.w_junc(bg.nodes['p'].data['f_junc']))
         
-    def forward(self,bg):
+    def forward(self,bg, finetune=False):
         """
         Args:
             bg: a batch of graphs
         """
         self.init_feature(bg)
         self.mp(bg)
-        # self.mp_aug(bg)
+        
+        if finetune:
+            return bg # return for GNN decoder.
+        else:
+            return self.encoder(bg) # if decoder is not MLP, then this is not needed, but a return for unified interface.
 
-        # embed_f = self.readout(bg,'h')
-        # embed_aug = self.readout_attn(bg,'aug')
-        # embed = torch.cat([embed_f,embed_aug],1)
-        # out = self.out(embed)
-        # embed_f_a = bg.nodes['a'].data['f_h']
-        # embed_f_p = bg.nodes['p'].data['f_h']
+    def encoder(self, bg):
+        """
+        Baseline for pretrain.
+        Extract embeddings directly from bg and do a simple cat.
+        """
+        embed_f_a = bg.nodes['a'].data['f_h']
+        embed_f_p = bg.nodes['p'].data['f_h']
         # embed_junc_h_a = bg.nodes['a'].data['f_junc_h']
         # embed_junc_h_p = bg.nodes['p'].data['f_junc_h']
-        # embed_aug_a = bg.nodes['a'].data['f_aug']
-        # embed_aug_p = bg.nodes['p'].data['f_aug']
-        # embed_junc_aug_a = bg.nodes['a'].data['f_junc_aug']
-        # embed_junc_aug_p = bg.nodes['p'].data['f_junc_aug']
 
+        # embed_a_fused = torch.mean(torch.stack([embed_f_a, embed_junc_h_a], dim=1), dim=1)
+        # mbed_p_fused = torch.mean(torch.stack([embed_f_p, embed_junc_h_p], dim=1), dim=1)
         
-        # embed_a = torch.mean(torch.stack([embed_f_a,embed_junc_h_a],dim=1),dim=1)
-        # embed_p = torch.mean(torch.stack([embed_f_p,embed_junc_h_p],dim=1),dim=1)
-        # embed_p = torch.mean(torch.stack([embed_f_p,embed_junc_h_p,embed_aug_p,embed_junc_aug_p],dim=1),dim=1)
-
-        embed_a,embed_p = self.fusion(bg)
-
-        return embed_a,embed_p
+        return embed_f_a, embed_f_p, bg
     
-class FeatureFusionGate(nn.Module):
-    def __init__(self, hidden_dim: int):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        # Linear layer to compute gates
-        self.gate_linear = nn.Linear(2 * hidden_dim, hidden_dim)
-        self.activation = nn.Sigmoid()  # For gating, sigmoid activation.
-        
-    def _process_node_type(self, embed_f, embed_junc):
-        """
-        Args:
-            embed_f: Tensor of shape [total_nodes, hidden_dim]
-            embed_junc: Tensor of shape [total_nodes, hidden_dim]
-        Returns:
-            fused_embed: Tensor of shape [total_nodes, hidden_dim]
-        """
-        # DGL已经保证了图的边界，我们可以直接处理所有节点
+class PharmHGT_FP(nn.Module):
+    """
+    PharmHGT pretrained pooling. FP: From Pretrained.
+    """
+    def __init__(self, cfg, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim):
+        super(PharmHGT_FP,self).__init__()
+        self.cfg = cfg
+        self.act = get_func(act)
+        self.depth = depth
+        self.output_dim = hid_dim
+        self.atom_dim = atom_dim
+        self.bond_dim = bond_dim
+        self.pharm_dim = pharm_dim
+        self.reac_dim = reac_dim
 
-        # Concatenate embeddings
-        concat_embed = torch.cat([embed_f, embed_junc], dim=1)  # [total_nodes, 2 * hidden_dim]
+        if self.cfg.train.readout == 'att':
+            self.readout = HierAttnReadout(hid_dim)
+        elif self.cfg.train.readout == 'cov':
+            self.readout = HeteroConvReadout(hid_dim)
+        elif self.cfg.train.readout == 'gru':
+            self.readout = Node_GRUReadout(hid_dim)
+
+        if self.cfg.train.pooling == 'mean':
+            self.pooling = GlobalPooling('mean')
+        elif self.cfg.train.pooling == 'sum':
+            self.pooling = GlobalPooling('sum')
+        elif self.cfg.train.pooling == 'max':
+            self.pooling = GlobalPooling('max')
+        elif self.cfg.train.pooling == 'concat':
+            self.pooling = GlobalPooling('concat')
+        else:
+            raise ValueError(f"Invalid pooling method: {self.cfg.train.pooling}")
         
-        # Compute gates
-        gates = self.activation(self.gate_linear(concat_embed))  # [total_nodes, hidden_dim]
+        # if gru readout, remove the pooling layer
+        if self.cfg.train.readout == 'gru':
+            self.pooling = None
         
-        # Fuse embeddings using gates
-        return gates * embed_f + (1 - gates) * embed_junc  # [total_nodes, hidden_dim]
-        
-    def forward(self, graph):
-        """
-        Args:
-            graph: DGL batched graph
-        Returns:
-            atom_repr: [num_atoms, hidden_dim]
-            frag_repr: [num_fragments, hidden_dim]
-        """
-        # Process atoms
-        atom_repr = self._process_node_type(
-            graph.nodes['a'].data['f_h'],
-            graph.nodes['a'].data['f_junc_h']
+        self.mlp = MLP(hid_dim, num_classes=cfg.train.num_tasks, readout=self.cfg.train.readout)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        for param in self.parameters():
+            if param.dim() == 1:
+                nn.init.constant_(param, 0)
+            else:
+                if self.act == nn.ReLU:
+                    nn.init.kaiming_normal_(param, mode='fan_in', nonlinearity='relu')
+                else:
+                    nn.init.xavier_normal_(param)
+
+    def load_model(
+            self,
+            checkpoint_path: str,
+            hid_dim: int,
+            act: str,
+            depth: int,
+            atom_dim: int,
+            bond_dim: int,
+            pharm_dim: int,
+            reac_dim: int,
+            device: torch.device
+        ):
+        model = PharmHGT(
+            hid_dim=hid_dim,
+            act=act,
+            depth=depth,
+            atom_dim=atom_dim,
+            bond_dim=bond_dim,
+            pharm_dim=pharm_dim,
+            reac_dim=reac_dim
         )
-        
-        # Process fragments
-        frag_repr = self._process_node_type(
-            graph.nodes['p'].data['f_h'],
-            graph.nodes['p'].data['f_junc_h']
+        model.to(device)
+
+        # model save code
+        # torch.save({
+        #     'epoch': epoch,
+        #     'encoder_state_dict': self.encoder.state_dict(),
+        #     'decoder_state_dict': self.decoder.state_dict(),
+        #     'optimizer_state_dict': self.optimizer.state_dict(),
+        #     'metrics': metrics,
+        # }, os.path.join(checkpoint_dir, "model.pt"))
+
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(state_dict["encoder_state_dict"])
+
+        # print model and estimate parameters
+        info(f"loaded model from {checkpoint_path}, with {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters.") 
+
+        return model
+    
+    def forward(self, bg):
+
+        # loading model
+        model = self.load_model(
+            checkpoint_path=self.cfg.train.checkpoint_path,
+            hid_dim=self.output_dim,
+            act=self.act,
+            depth=self.depth,
+            atom_dim=self.atom_dim,
+            bond_dim=self.bond_dim,
+            pharm_dim=self.pharm_dim,
+            reac_dim=self.reac_dim,
+            device=bg.device
         )
+
+        # embedding extraction
+        with torch.no_grad():
+            bg = model(bg, finetune=True)
+
+        # if readout
+        if self.readout:
+            bg = self.readout(bg)
+
+        # pooling
+        if self.pooling != "gru":
+            bg_embeds = self.pooling(bg)  # => shape [B, hid_dim]
+        else:
+            bg_embeds = bg # bg by gru readout is a graph_embed
+
+        # mlp
+        if bg_embeds:
+            logits = self.mlp(bg_embeds)  # => shape [B, num_classes]
+
+        return logits # shape [B, 1] for binary classification
+    
+class MLP(nn.Module):
+    """feed bg_embeds to MLP and give binary classification, note that num_classes=1"""
+    def __init__(self, hid_dim, num_classes, readout):
+        super(MLP,self).__init__()
+        if readout == 'gru':
+            self.fst_layer = nn.Linear(2*hid_dim, hid_dim)
+        else:
+            self.fst_layer = nn.Linear(hid_dim, hid_dim)
+        self.mlp = nn.Sequential(
+            self.fst_layer,
+            nn.LayerNorm(hid_dim),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(hid_dim, hid_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(hid_dim // 2, num_classes)
+        )
+    def forward(self,bg_embeds):
+        return self.mlp(bg_embeds)
+    
+class Node_GRUReadout(nn.Module):
+    """
+    Use explicit length-based Mask instead of judging whether the feature is 0.
+    - Split the 'a' and 'p' nodes into (B, Lx, D) forms respectively;
+    - Use node_size_a[i], node_size_p[i] to generate mask;
+    - Perform cross-attention (a => p) or (p => a) in multi-head attention;
+    - Then use GRU to process the sequence and aggregate to get graph-level embedding.
+    """
+    def __init__(self, hid_dim, bidirectional=True):
+        super(Node_GRU, self).__init__()
+        self.hid_dim = hid_dim
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
         
-        return atom_repr, frag_repr
+        # Cross-Attention: query=a, key=value=p
+        self.cross_attn = MultiHeadedAttention(h=4, d_model=hid_dim)
+        
+        # GRU for sequences: [B, L, hid_dim * num_directions]
+        self.gru = nn.GRU(hid_dim, hid_dim, batch_first=True, 
+                          bidirectional=bidirectional)
+        
+    def _pad_nodes(self, bg, ntype, field, device):
+        """
+        Split the node features of ntype in bg into [B, maxL, hid_dim] and return:
+        - padded_features: zero-padding for each graph
+        - mask: indicates which positions are padding (True means padding, invalid)
+        - node_sizes: vector of length B, the actual number of nodes in each graph
+        """
+        feat = bg.nodes[ntype].data[field]    # [total_num_nodes, hid_dim]
+        node_sizes = bg.batch_num_nodes(ntype)  # [B] node number for each graph
+        max_len = node_sizes.max().item()
+        
+        # prepare a tensor to store zero-padded features
+        padded_features = feat.new_zeros((bg.batch_size, max_len, feat.size(-1)))
+        
+        # prepare a mask at the same time: [B, max_len], True indicates padding position
+        # first default to all True, then mark the real node part as False
+        mask = torch.ones((bg.batch_size, max_len), dtype=torch.bool, device=device)
+        
+        # cumulative index to align feats
+        start_idx = 0
+        for i in range(bg.batch_size):
+            size_i = node_sizes[i].item()
+            if size_i > 0:
+                # take the node vector belonging to the i-th graph
+                cur_feats = feat[start_idx : start_idx + size_i]      # [size_i, hid_dim]
+                padded_features[i, :size_i] = cur_feats
+                # set the mask position corresponding to the valid node part to False
+                mask[i, :size_i] = False
+            start_idx += size_i
+
+        return padded_features, mask, node_sizes
+    
+    def forward(self, bg, suffix='h'):
+        """
+        1) Pad the 'a' and 'p' nodes to (B, La, D) / (B, Lp, D) respectively;
+        2) Perform cross-attention: query=a, key/value=p;
+        - Construct cross_mask to mask the padding part;
+        3) Add the residual with the original feature (optional);
+        4) Process the output with GRU;
+        5) Perform mean or max aggregation on the sequence output according to node_sizes (such as p nodes) to obtain the graph-level vector.
+        """
+        device = bg.device
+        
+        # 1) get the features of nodes a and p and pad them
+        a_padded, a_mask, a_sizes = self._pad_nodes(bg, 'a', f'f_{suffix}', device)
+        p_padded, p_mask, p_sizes = self._pad_nodes(bg, 'p', f'f_{suffix}', device)
+        # a_padded, p_padded: [B, Lmax, hid_dim]
+        # a_mask, p_mask: [B, Lmax] (True => padding)
+        
+        # 2) construct cross_mask, shape [B, La, Lp], True positions are masked in attention
+        # If position a is padding, or position p is padding, set to True
+        # a_mask: (B, La), p_mask: (B, Lp)
+        # cross_mask[b, i, j] = True if (a_mask[b,i] = True or p_mask[b,j] = True)
+        B, La, D = a_padded.shape
+        _, Lp, _ = p_padded.shape
+        
+        a_mask_3d = a_mask.unsqueeze(-1).expand(B, La, Lp)  # (B, La, Lp)
+        p_mask_3d = p_mask.unsqueeze(1).expand(B, La, Lp)  # (B, La, Lp)
+        cross_mask = a_mask_3d | p_mask_3d                 # element-wise OR
+        
+        # 3) do cross-attention: query=a, key=p, value=p
+        # first align the mask dimensions to the attention requirements -> [B, La, Lp]
+        a_updated = self.cross_attn(query=a_padded, key=p_padded, value=p_padded, mask=cross_mask)
+        
+        # residue: a_updated + a_padded
+        a_updated = a_padded + a_updated
+        
+        # 4) process with GRU (B, La, D)
+        # initialize hidden: [num_directions, B, hid_dim]
+        hidden_0 = a_updated.mean(dim=1, keepdim=True)  # shape (B,1,D)
+        hidden_0 = hidden_0.repeat(self.num_directions, 1, 1)  # [num_directions, B, D]
+        
+        # run GRU
+        # a_out: [B, La, hid_dim * num_directions]
+        a_out, hidden_n = self.gru(a_updated, hidden_0)
+        
+        # 5) aggregate a_out after unpadding (or aggregate directly on the padded tensor)
+        # do mean pooling on a_out to get the embedding of each graph
+        graph_embed = []
+        for i in range(bg.batch_size):
+            length_i = a_sizes[i].item()
+            # If length_i=0, fill in 0
+            if length_i == 0:
+                graph_embed.append(a_out.new_zeros(1, self.num_directions * self.hid_dim))
+            else:
+                # a_out[i, :length_i], shape=(L_i, hid_dim * dir)
+                g_i = a_out[i, :length_i].mean(dim=0)
+                graph_embed.append(g_i.unsqueeze(0))
+
+        graph_embed = torch.cat(graph_embed, dim=0)  # [B, hid_dim * num_directions]
+        return graph_embed
+    
+class AmpHGT_FT(nn.Module):
+    """
+    AmpHGT (PharmHGT_pretrained + pooling/readout) trained. FT: From Trained.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        pass

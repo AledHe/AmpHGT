@@ -6,13 +6,16 @@ Fragmentize Side Chain Even Sub-Sidechain (FraSCESS)
 Similar to AdaFrag, but we strictly distinguish between side chains and main chains as well as terminal groups.
 """
 
+import functools
 import random
-import time
-from typing import List, Optional, Set, Tuple
 import dgl
 import torch
 
+from typing import List, Optional, Tuple
+
 from utils.features import ATOM_FEATURES, factory, allowable_features
+from utils.std_logger import warning
+from .callMacFrag import call_MacFrag
 
 from rdkit import Chem
 from rdkit.Chem import MACCSkeys
@@ -31,9 +34,18 @@ def mol2heterograph_frascess(mol: Chem.Mol, sdf_path: str = None, vocab_dict: di
     # a, j, p: atom-to-fragment junctions, connection from an atoms to the fragment they belongs to.
     # p, j, a: fragment-to-atom junctions, connection from a fragment to the atoms they belongs to.
 
-    result_ap, result_p, result_frag, result, brics_bonds_rules, bonds_to_break_all  = get_fragment_feats(mol, sdf_path=sdf_path)
+    result_ap, result_p, result_frag, result, brics_bonds_rules, bonds_to_break_all = get_fragment_feats_o(mol, sdf_path=sdf_path)
+
+    # result_ap_, result_p_, result_frag_, result_, brics_bonds_rules_, bonds_to_break_all_ = get_fragment_feats_o(mol, sdf_path=sdf_path)
+
+    # print(result_ap == result_ap_, result_p == result_p_, result_frag == result_frag_, result == result_, brics_bonds_rules == brics_bonds_rules_, bonds_to_break_all == bonds_to_break_all_)
+
+    # exit()
     
-    atom_frag_label = map_frag_atom_to_mol(mol, bonds_to_break_all)
+    # atom_frag_label = map_frag_atom_to_mol(mol, bonds_to_break_all)
+    atom_frag_label = map_frag_atom_to_mol_o(mol, bonds_to_break_all)
+
+    # assert atom_frag_label == atom_frag_label_
 
     # print("reac_idx", result) [[0, 0, 1], [14, 16, 15],...
     # print("bbr", brics_bonds_rules) [[[0, 1], [0, True, False, False...
@@ -80,10 +92,12 @@ def mol2heterograph_frascess(mol: Chem.Mol, sdf_path: str = None, vocab_dict: di
         f_atom.append(atom_features(atom))
         # print(f_atom, atom_features(atom))
         # print(result_frag[result_ap[int(idx)]])
-        if get_pharm_label(result_frag[result_ap[int(idx)]], vocab_dict) == 0: # don't mask amide bond atoms.
+        if get_pharm_label(result_frag[result_ap[int(idx)]], vocab_dict, sdf_path) == 0: # don't mask alpha backbone atoms.
             atom_canmask.append(False)
         else:
             atom_canmask.append(True)
+
+    # print(atom_canmask)
 
     # print(f_atom)
     f_atom = torch.FloatTensor(f_atom) # convert the atom features to a tensor.
@@ -91,8 +105,8 @@ def mol2heterograph_frascess(mol: Chem.Mol, sdf_path: str = None, vocab_dict: di
     atom_label_list = torch.LongTensor(atom_label_list) # convert the atom labels to a tensor.
     g.nodes['a'].data['label'] = atom_label_list
     atom_canmask = torch.BoolTensor(atom_canmask)
-    g.nodes['a'].data['pep'] = atom_canmask # pep is the amide bond label, if false, atom will not be masked.
-                                            # more specifically, the NC=O struct (all atom) won't be mask.
+    g.nodes['a'].data['pep'] = atom_canmask # pep is the alpha backbone label, if false, atom will not be masked.
+                                            # more specifically, the NCC=O struct (all atom) won't be mask.
     atom_aa_label_list = torch.LongTensor(atom_aa_label_list)
     g.nodes['a'].data['aa_label'] = atom_aa_label_list # atom and its corresponding fragment index.
 
@@ -114,7 +128,7 @@ def mol2heterograph_frascess(mol: Chem.Mol, sdf_path: str = None, vocab_dict: di
     # print(result_p) {0: [0, 0,..], 1: [[0, 1,...]...} pharmacophore features for each fragment.
     for k,v in result_p.items():
         frag = result_frag[k] # get the SMILES of the fragment molecule.
-        pharm_label_list.append(get_pharm_label(frag, vocab_dict))
+        pharm_label_list.append(get_pharm_label(frag, vocab_dict, sdf_path))
         f_pharm.append(v)
 
     # print(f_pharm) # concatenated pharmacophore features for each fragment.
@@ -185,14 +199,33 @@ def atom_features(atom: Chem.rdchem.Atom):
            [atom.GetMass() * 0.01]  # scaled to about the same range as other features
     return features
 
-def get_pharm_label(frag:str, vocab_dict:dict):
+def get_pharm_label(frag:str, vocab_dict:dict, sdf_path: str):
     if frag not in vocab_dict.keys():
-        print(f'Warning Unfound fragments {frag}')
-        pass
+        print(f'Warning Unfound fragments {frag} in {sdf_path}') # suppress the warning
     else:
         # print(frag)
         pass
     return vocab_dict.get(frag, len(vocab_dict) - 1)
+
+def map_frag_atom_to_mol_o(mol: Chem.Mol, bonds_to_break: list):
+    """
+    optimized version of map_frag_atom_to_mol, fall back to it if you think the code is too slow.
+    """
+    for atom in mol.GetAtoms():
+        atom.SetProp('orig_idx', str(atom.GetIdx()))
+    
+    if bonds_to_break:
+        fragmented_mol = Chem.FragmentOnBonds(mol, bonds_to_break, addDummies=False)
+        mol_fragments = Chem.GetMolFrags(fragmented_mol, asMols=True)
+        aa_label = {}
+        for frag_idx, frag in enumerate(mol_fragments):
+            for atom in frag.GetAtoms():
+                orig_idx = int(atom.GetProp('orig_idx'))
+                aa_label[orig_idx] = frag_idx
+        return aa_label
+    else:
+        # no bonds to break, return the original molecule
+        return {atom.GetIdx(): 1 for atom in mol.GetAtoms()}
 
 def map_atom_indices(fragment, mol):
     """
@@ -229,6 +262,51 @@ def map_frag_atom_to_mol(mol: Chem.Mol, bonds_to_break: list):
 
     return aa_label
 
+### get_fragment_feats
+
+def get_fragment_feats_o(mol: Chem.Mol, sdf_path: str = None):
+    bonds_to_break = get_bond_by_prop(mol)
+    bonds_to_break_all, break_bonds_atoms = fragmentize_by_bond(mol, bonds_to_break, sdf_path, FraSCESS=True)
+    temp_mol = Chem.FragmentOnBonds(mol, bonds_to_break_all, addDummies=False)
+    fragment_idx_list = Chem.GetMolFrags(temp_mol)
+    fragment_mol_list = Chem.GetMolFrags(temp_mol, asMols=True)
+
+    result_ap, result_p, result_frag = {}, {}, {}
+    pharm_id = 0
+
+    for pharm_id, fragment_idx in enumerate(fragment_idx_list):
+        for atom_id in fragment_idx:
+            result_ap[atom_id] = pharm_id
+        mol_pharm = fragment_mol_list[pharm_id]
+        try:
+            emb_0 = maccskeys_emb_o(mol_pharm) + [0]
+            emb_1 = pharm_property_types_feats_o(mol_pharm) + [0]
+        except Exception:
+            emb_0 = [0 for i in range(168)]
+            emb_1 = [0 for i in range(28)]
+            warning(f"Failed to generate features for fragment {pharm_id} in {sdf_path}")
+        result_p[pharm_id] = emb_0 + emb_1
+        result_frag[pharm_id] = Chem.MolToSmiles(mol_pharm, canonical=True)
+
+    brics_bonds_set = set()
+    brics_bonds_rules = []
+    for item in break_bonds_atoms:
+        a, b = int(item[0]), int(item[1])
+        bond = mol.GetBondBetweenAtoms(a, b)
+        if bond is None:
+            continue
+        feats = bond_features(bond)
+        brics_bonds_set.update({(a, b), (b, a)})
+        brics_bonds_rules.extend([[[a, b], feats], [[b, a], feats]])
+
+    result = []
+    for bond in mol.GetBonds():
+        begin, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if (begin, end) in brics_bonds_set:
+            result.append([bond.GetIdx(), begin, end])
+
+    return result_ap, result_p, result_frag, result, brics_bonds_rules, bonds_to_break_all
+
 def get_fragment_feats(mol: Chem.Mol, sdf_path: str = None):
     # get bond to break
     bonds_to_break = get_bond_by_prop(mol)
@@ -256,18 +334,29 @@ def get_fragment_feats(mol: Chem.Mol, sdf_path: str = None):
             result_ap[atom_id] = pharm_id # maps atoms to their corresponding pharmacophore ID.
         try: # after mapping atoms to their corresponding pharmacophore ID, we generate the pharmacophore features for each fragment.
             mol_pharm = Chem.MolFromSmiles(Chem.MolFragmentToSmiles(mol, fragment_idx))
-            emb_0 = maccskeys_emb(mol_pharm) # what? you don't know Molecular ACCess System? well...
+            emb_0 = maccskeys_emb_o(mol_pharm) # In case you don't know Molecular ACCess System
                                              # To be brief, it is a fixed-length bit string that represents substructure or fragment of a molecule.
                                              # as [0, 0, 0, 0, 0, 1, ..., 0, 1...]
                                              # however, it cannot encode structural features that are not pre-defined in the fragment library.
                                              # for MACCS, only the 166 fragment definitions are available to the public.
                                              # feature 1.
+            # emb_0 = maccskeys_emb(mol_pharm)
+            # emb_0_o = maccskeys_emb_o(mol_pharm)
+
+            # assert emb_0 == emb_0_o
+
             emb_0 = emb_0 + [0]
-            emb_1 = pharm_property_types_feats(mol_pharm) # generates pharmacophore property features for the fragment molecule mol_pharm.
+            emb_1 = pharm_property_types_feats_o(mol_pharm) # generates pharmacophore property features for the fragment molecule mol_pharm.
+            # emb_1 = pharm_property_types_feats(mol_pharm)
+            # emb_1_o = pharm_property_types_feats_o(mol_pharm)
+            
+            # assert emb_1 == emb_1_o
+
             emb_1 = emb_1 + [0]
         except Exception:
             emb_0 = [0 for i in range(168)]
             emb_1 = [0 for i in range(28)]
+            warning(f"Failed to generate MACCS keys for fragment {Chem.MolToSmiles(fragment_mol_list[pharm_id])} in {sdf_path}")
 
         result_p[pharm_id] = emb_0 + emb_1 # result/sum the pharmacophore features for each fragment.
         result_frag[pharm_id] = Chem.MolToSmiles(fragment_mol_list[pharm_id], canonical=True) # get the SMILES of the fragment molecule.
@@ -297,6 +386,8 @@ def get_fragment_feats(mol: Chem.Mol, sdf_path: str = None):
 
     return result_ap, result_p, result_frag, result, brics_bonds_rules, bonds_to_break_all
 
+### get_fragment_feats
+
 def get_bond_by_prop(mol: Chem.Mol) -> Tuple[List[int], List[Tuple[int, int]]]:
     """
     Break bonds in a molecule by a property 'LinkingBond'.
@@ -313,17 +404,27 @@ def get_backbone_cut_idx(mol: Chem.Mol, sdf_path: str) -> Tuple[List[int], List[
     atom_bond_pairs = []
 
     for bond in mol.GetBonds():
-        atom1, atom2 = bond.GetBeginAtom(), bond.GetEndAtom()
-        if {atom1.GetSymbol(), atom2.GetSymbol()} == {"N", "C"}:
-            carbon_atom = atom2 if atom1.GetSymbol() == "N" else atom1
-            if any(neighbor.GetSymbol() == "O" and 
-                   any(nb.GetBondType() == Chem.rdchem.BondType.DOUBLE for nb in neighbor.GetBonds())
-                   for neighbor in carbon_atom.GetNeighbors()):
-                bonds_to_break.append(bond.GetIdx())
-                atom_bond_pairs.append((atom1.GetIdx(), atom2.GetIdx()))
+        # if bonds have prop "AmideBonds", then break
+        if bond.HasProp("AmideBond"):
+            bonds_to_break.append(bond.GetIdx())
+            atom_bond_pairs.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))
+
+    # if no bonds have prop "AmideBonds", then break the bond between the alpha carbon and the nitrogen
+    if not bonds_to_break:
+        print("Please set 'AmideBond' prop to your SMILES, or it may lead inaccurate results.")
+        for bond in mol.GetBonds():
+            atom1, atom2 = bond.GetBeginAtom(), bond.GetEndAtom()
+            if {atom1.GetSymbol(), atom2.GetSymbol()} == {"N", "C"}:
+                carbon_atom = atom2 if atom1.GetSymbol() == "N" else atom1
+                if any(neighbor.GetSymbol() == "O" and 
+                    any(nb.GetBondType() == Chem.rdchem.BondType.DOUBLE for nb in neighbor.GetBonds())
+                    for neighbor in carbon_atom.GetNeighbors()):
+                    bonds_to_break.append(bond.GetIdx())
+                    atom_bond_pairs.append((atom1.GetIdx(), atom2.GetIdx()))
 
     if not bonds_to_break:
         print(f"No valid backbone bonds found in the molecule, {Chem.MolToSmiles(mol)}, {sdf_path}")
+        print(f"This should not happen. But code will continue...")
 
     return bonds_to_break, atom_bond_pairs
 
@@ -335,7 +436,7 @@ def fragmentize_by_bond(mol: Chem.Mol, bonds_to_break: List[int], sdf_path: str,
     all_bonds_to_break = set(bonds_to_break)
 
     if not bonds_to_break:
-        print(f"Warning: No bonds to break in the peptide. Please check the input molecule {sdf_path}.")
+        print(f"Warning: No sidechain bonds to break in the peptide. Please check the input molecule {Chem.MolToSmiles(mol)}.")
         print(f"But we will try to proceed...")
         # Directly process by backbone_cut
         backbone_idx = get_backbone([mol], sdf_path)
@@ -373,8 +474,9 @@ def fragmentize_by_bond(mol: Chem.Mol, bonds_to_break: List[int], sdf_path: str,
                         original_bond_idx = original_bond.GetIdx()
                         all_bonds_to_break.add(original_bond_idx)
                 else:
+                    # print SMILES of the fragment
+                    # print(Chem.MolToSmiles(frag))
                     if FraSCESS:
-                        # Randomly break bonds until fragment is divided into at least two substructures
                         fragmentize_sidechain(frag, mol, all_bonds_to_break, sdf_path)
 
         for j, frag in enumerate(temp_mol_tuple):
@@ -398,8 +500,22 @@ def fragmentize_by_bond(mol: Chem.Mol, bonds_to_break: List[int], sdf_path: str,
 
     return all_bonds_to_break, atom_bond_atom
 
-def fragmentize_sidechain(frag: Chem.Mol, mol: Chem.Mol, all_bonds_to_break: set, sdf_path: str, seed: int = 42):
+def fragmentize_sidechain(frag: Chem.Mol, mol: Chem.Mol, all_bonds_to_break: set, sdf_path: str):
+    mapping_atom = map_atom_indices(frag, mol)
+
+    return_flag = call_MacFrag(frag, mol, mapping_atom, all_bonds_to_break, sdf_path)
+
+    if return_flag == 0: # success
+        return
+    elif return_flag == 1: # cannot fragmentize further
+        # print(f"Warning: failed to fragmentize a sidechain. {sdf_path}, {Chem.MolToSmiles(frag)}") # too noisy
+        return
+
+def fragmentize_sidechain_dep(frag: Chem.Mol, mol: Chem.Mol, all_bonds_to_break: set, sdf_path: str, seed: int = 42):
     # print(Chem.MolToSmiles(frag))
+    # TODO: Implement MacFrag instead of Random.
+    # We will need to modify MacFrag to adapt our style.
+    # if a sidechain is not fragmentizable in any way, mark it for not masking.
     random.seed(seed)
     bonds = []
     for bond in frag.GetBonds():
@@ -469,16 +585,24 @@ def fragmentize_sidechain(frag: Chem.Mol, mol: Chem.Mol, all_bonds_to_break: set
 
 def get_backbone(frags_mol_lst: List[Chem.Mol], sdf_path: str) -> Optional[int]:
     """
-    Return the fragment index with the most N-C=O substructure.
+    Return the fragment index fit the rule.
     """
-    bond_smiles = "C(=O)N"
+    bond_smiles = "[CX3](=O)[NX3;H1]"
     max_match = 0
+    max_prop_count = 0
     idx = None
     
     for i, frag in enumerate(frags_mol_lst):
-        matches = frag.GetSubstructMatches(Chem.MolFromSmarts(bond_smiles))
-        if len(matches) > max_match:
-            max_match = len(matches)
+        # The backbone fragment is the fragment have the most N-C=O substructure and 
+        # have the most bond with AmideBond prop.
+        match_count = len(frag.GetSubstructMatches(Chem.MolFromSmarts(bond_smiles)))
+        
+        prop_count = sum(1 for bond in frag.GetBonds() if bond.HasProp("AmideBond"))
+
+        if prop_count > max_prop_count or (match_count > max_match and prop_count >= max_prop_count):
+            max_match = match_count
+            max_prop_count = prop_count
+            # print(f"Match count: {match_count}, Prop count: {prop_count}, idx: {i}")
             idx = i
 
     if idx is None:
@@ -486,8 +610,46 @@ def get_backbone(frags_mol_lst: List[Chem.Mol], sdf_path: str) -> Optional[int]:
     
     return idx
 
+### maccskeys_emb
+
+@functools.lru_cache()
+def _maccskeys_emb_cached(smiles: str):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES string: {smiles}")
+    return list(MACCSkeys.GenMACCSKeys(mol))
+
+def get_smiles(mol: Chem.Mol) -> str:
+    return Chem.MolToSmiles(mol, isomericSmiles=True, canonical=True)
+
+def maccskeys_emb_o(mol: Chem.Mol):
+    smiles = get_smiles(mol)
+    return _maccskeys_emb_cached(smiles)
+
 def maccskeys_emb(mol):
     return list(MACCSkeys.GenMACCSKeys(mol))
+
+### maccskeys_emb
+
+### pharm_property_types_feats
+
+@functools.lru_cache()
+def _pharm_property_types_feats_cached(smiles: str):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES string: {smiles}")
+
+    types = [i.split('.')[1] for i in factory.GetFeatureDefs().keys()]
+    feats = [i.GetType() for i in factory.GetFeaturesForMol(mol)]
+    result = [0] * len(types)
+    for i in range(len(types)):
+        if types[i] in list(set(feats)):
+            result[i] = 1
+    return result
+
+def pharm_property_types_feats_o(mol):
+    smiles = get_smiles(mol)
+    return _pharm_property_types_feats_cached(smiles)
 
 def pharm_property_types_feats(mol,factory=factory): 
     # extracts the types of pharmacophore features from the feature factory definitions.
@@ -500,6 +662,8 @@ def pharm_property_types_feats(mol,factory=factory):
         if types[i] in list(set(feats)):
             result[i] = 1
     return result
+
+### pharm_property_types_feats
 
 def bond_features(bond: Chem.rdchem.Bond):
     if bond is None:

@@ -1,11 +1,16 @@
 # utils/seed_device.py
 """Get devices and set seed for reproducibility."""
 import os
+import string
 import torch
 import random
 import numpy as np
 from typing import List, Union
 import torch.distributed as dist
+
+def generate_random_string():
+    characters = string.ascii_letters + string.digits
+    print(''.join(random.choice(characters) for i in range(128)))
 
 def get_device() -> List[torch.device]:
     """

@@ -2,10 +2,11 @@ import random
 import torch
 import dgl
 from utils.std_logger import info
-from typing import Dict, List, Optional, Tuple
 
 from .features import ATOM_FEATURES
 from .FraSCESS.mol2heterograph_FraSCESS import onek_encoding_unk
+
+# revised the mask graph code, corrected the not masking amide bond to not masking alpha backbone. 25.2.8
 
 class MaskGraph:
     def __init__(self, 
@@ -14,37 +15,34 @@ class MaskGraph:
                  mask_edge: bool = True,
                  mask_atom: bool = True, 
                  mask_fragment: bool = True, 
-                 mask_edge_r: float = 0.1,
-                 mask_atom_r: float = 0.1, 
-                 mask_fragment_r: float = 0.1,
+                 mask_rate: float = 0.8, # unified mask rate for atom, edge and fragment.
+                 # mask_amino: float = 0.0, # mask atoms according to aa_label, this is disabled in pepland.
                  ):
         """
         According to the input parameters, mask the graph by following the rules:
         (1)	Random masking: Atoms not part of the backbone chain of the peptide graph are randomly masked.
         (2)	Fragment masking: Randomly masking fragments in the peptide graph, which can include sidechain, parts of the sidechain or sections of the backbone.
         
-        :param num_atom_type: Number of atom types in the graph.
-        :param num_edge_type: Number of edge types in the graph.
+        :param num_atom_type: 119 by default, tell model it is a masked atom. the 119 atom is currently not found by human.
+        :param num_edge_type: 5 by default, tell model it is a masked bond.
+        Note that above two param is not currently used for we've stored labels in g.nodes['a'].data['label'],
+        Directly classification features using CrossEntropyLoss to match.
         :param mask_edge: Whether to mask edges in the graph.
         :param mask_atom: Whether to mask atoms in the graph.
         :param mask_fragment: Whether to mask fragments in the graph.
-        :param mask_atom_r: The ratio of atoms to be masked.
-        :param mask_fragment_r: The ratio of fragments to be masked.
+        :param mask_rate: The rate of masking for atom, edge and fragment.
+        :param mask_amino: The rate of masking for atom according to aa_label. deprecated
 
         A large portion of this code is adapted from Pepland.
+        Randomness here is okay as it is masking processing.
         """
-        # Validate input parameters
-        self._validate_init_params(num_atom_type, num_edge_type, 
-                                 mask_edge_r, mask_atom_r, mask_fragment_r)
-
         self.num_atom_type = num_atom_type
         self.num_edge_type = num_edge_type
         self.mask_edge = mask_edge
         self.mask_atom = mask_atom
         self.mask_fragment = mask_fragment
-        self.mask_edge_r = mask_edge_r
-        self.mask_atom_r = mask_atom_r
-        self.mask_fragment_r = mask_fragment_r
+        self.mask_rate = mask_rate
+        # self.mask_amino = mask_amino
         
         # Cache feature dimensions for validation
         self.atom_feat_dim = self._get_atom_feat_dim()
@@ -52,21 +50,6 @@ class MaskGraph:
 
         info(f"Initialized MaskGraph with atom_feat_dim={self.atom_feat_dim}, "
                     f"fragment_feat_dim={self.fragment_feat_dim}")
-        
-    def _validate_init_params(self, 
-                              num_atom_type: int, 
-                              num_edge_type: int, 
-                              mask_edge_r: float, 
-                              mask_atom_r: float, 
-                              mask_fragment_r: float
-                              ):
-        """Validate initialization parameters."""
-        if not all(isinstance(x, int) and x > 0 for x in [num_atom_type, num_edge_type]):
-            raise ValueError("num_atom_type and num_edge_type must be positive integers")
-        
-        if not all(isinstance(x, float) and 0 <= x <= 1 for x in [mask_edge_r, mask_atom_r, mask_fragment_r]):
-            raise ValueError("Masking ratios must be float values between 0 and 1")
-        
 
     def _get_atom_feat_dim(self) -> int:
         """Get the dimension of atom features."""
@@ -86,16 +69,6 @@ class MaskGraph:
             raise ValueError(f"Fragment feature dimension mismatch. Expected {self.fragment_feat_dim}, "
                            f"got {g.nodes['p'].data['f'].shape[-1]}")
         
-    def _create_mask_indices(self, num_elements: int, mask_ratio: float, 
-                           exclude_indices: Optional[List[int]] = None) -> List[int]:
-        """Create mask indices with exclusion support."""
-        available_indices = list(range(num_elements))
-        if exclude_indices:
-            available_indices = list(set(available_indices) - set(exclude_indices))
-            
-        mask_size = max(1, int(len(available_indices) * mask_ratio))
-        return random.sample(available_indices, min(mask_size, len(available_indices)))
-        
     def __call__(self, g: dgl.DGLHeteroGraph):
         # Validate feature dimensions
         self._validate_feature_dims(g)
@@ -104,10 +77,79 @@ class MaskGraph:
         orig_atom_feats = g.nodes['a'].data['f'].clone()
         orig_frag_feats = g.nodes['p'].data['f'].clone()
 
+        num_atoms = g.number_of_nodes('a')
+        final_atom_mask = torch.zeros(num_atoms, dtype=torch.bool)
+
+        # mask atoms according to aa_label, in other words, mask atoms in fragments (for each fragment, masking num_amino * self.mask_amino + 1).
+        # if self.mask_atom and self.mask_amino > 0:
+        #     amino = torch.unique(g.nodes['a'].data['aa_label'])
+        #     print(amino)
+        #     num_amino = len(amino)
+        #     sample_size = int(num_amino * self.mask_amino + 1)
+        #     masked_amino_indices = random.sample(range(num_amino), sample_size)
+        #     mask_amino = amino[masked_amino_indices]
+
+        #     atom_mask = torch.zeros(g.num_nodes('a'), dtype=torch.bool)
+        #     print(atom_mask)
+        #     for aa in mask_amino:
+        #         atom_mask |= (g.nodes['a'].data['aa_label'] == aa)
+
+        #     print(atom_mask)
+
+        #     g.nodes['a'].data['f'][atom_mask] = torch.FloatTensor(atom_mask_features()).repeat(atom_mask.sum(), 1)
+        #     # g.nodes['a'].data['mask'] = atom_mask
+        #     final_atom_mask |= atom_mask
+
+        # mask atoms except for amide bonds (essentially mask again after masked amino atoms, this time for all atoms excerpt for amide bonds)
+        if self.mask_atom and self.mask_rate > 0:
+            # get maskable, g.nodes['a'].data['pep'] is bool list. when false, the atom cannot be masked.
+            maskable_atoms = g.nodes('a')[g.nodes['a'].data['pep']]
+            # print(maskable_atoms)
+            num_maskable = len(maskable_atoms)
+            # print(num_maskable)
+
+            # create mask indices
+            sample_size = int(num_maskable * self.mask_rate + 1)
+
+            # pick actual node IDs, not sublist indices
+            masked_atom_indices = random.sample(maskable_atoms.tolist(), sample_size)
+            
+            # masked_atom_indices = random.sample(range(num_maskable), sample_size)
+            # print(masked_atom_indices)
+            
+            node_mask = torch.zeros(num_atoms, dtype=torch.bool)
+            # print(node_mask, node_mask.shape) # all false
+            node_mask[masked_atom_indices] = True
+            # print(node_mask, node_mask.shape) # indices are true
+            # g.nodes['a'].data['mask'] = node_mask
+            g.nodes['a'].data['f'][node_mask] = torch.FloatTensor(atom_mask_features()).repeat(node_mask.sum(), 1)
+            # print(g.nodes['a'].data['f'][node_mask], g.nodes['a'].data['f'][node_mask].shape)
+            # print(g.nodes['a'].data['f'], g.nodes['a'].data['f'].shape)
+            # also store the unmasked features for target reconstruction
+            g.nodes['a'].data['f_unmasked'] = orig_atom_feats
+            # print(g.nodes['a'].data['f_unmasked'], g.nodes['a'].data['f_unmasked'].shape)
+
+            # assert there should be different between the masked and unmasked features
+            assert not torch.allclose(g.nodes['a'].data['f'][node_mask], g.nodes['a'].data['f_unmasked'][node_mask])
+
+            # print(node_mask)
+
+            final_atom_mask |= node_mask
+            
+            if self.mask_edge:
+                self._apply_edge_masking(g, masked_atom_indices)
+        
+        # atom masking is done
+        g.nodes['a'].data['mask'] = final_atom_mask
+
         # Fragment masking
         if self.mask_fragment:
             num_pharms = g.number_of_nodes('p')
-            masked_pharm_indices = self._create_mask_indices(num_pharms, self.mask_fragment_r)
+
+            sample_size = int(num_pharms * self.mask_rate + 1)
+            masked_pharm_indices = random.sample(range(num_pharms), sample_size)
+
+            # print(masked_pharm_indices)
             
             # Create and store mask
             node_mask = torch.zeros(num_pharms, dtype=torch.bool)
@@ -118,44 +160,40 @@ class MaskGraph:
             mask_feats = torch.FloatTensor(GetMaskFragmentFeats())
             g.nodes['p'].data['f'][node_mask] = mask_feats
 
-        # Atom masking with structural awareness
-        if self.mask_atom:
-            num_atoms = g.number_of_nodes('a')
-            # Use structure-independent masking criteria
-            maskable_atoms = torch.ones(num_atoms, dtype=torch.bool)
-            masked_atom_indices = self._create_mask_indices(num_atoms, self.mask_atom_r)
-            
-            # Create and store mask
-            node_mask = torch.zeros(num_atoms, dtype=torch.bool)
-            node_mask[masked_atom_indices] = True
-            g.nodes['a'].data['mask'] = node_mask
-            
-            # Apply masking
-            mask_feats = torch.FloatTensor(atom_mask_features())
-            g.nodes['a'].data['f'][node_mask] = mask_feats
+            # also store the unmasked features for target reconstruction
+            g.nodes['p'].data['f_unmasked'] = orig_frag_feats
 
-        # Edge masking (if needed)
-        if self.mask_edge:
-            self._apply_edge_masking(g)
+            assert not torch.allclose(g.nodes['p'].data['f'][node_mask], g.nodes['p'].data['f_unmasked'][node_mask])
 
+        # exit()
         # Validate masking results
         self._validate_masking_results(g, orig_atom_feats, orig_frag_feats)
 
         # exit("Test")
         return g
 
-    def _apply_edge_masking(self, g: dgl.DGLHeteroGraph):
+    def _apply_edge_masking(self, g: dgl.DGLHeteroGraph, masked_atom_indices: torch.Tensor):
         """Apply edge masking with proper feature handling."""
-        num_edges = g.number_of_edges('b')
-        masked_edge_indices = self._create_mask_indices(num_edges, self.mask_edge_r)
+        connected_edge_indices = []
         
-        edge_mask = torch.zeros(num_edges, dtype=torch.bool)
-        edge_mask[masked_edge_indices] = True
+        # Get connected edges with masked atoms
+        for atom_idx in masked_atom_indices:
+            in_edges = g.in_edges(atom_idx, etype='b')
+            out_edges = g.out_edges(atom_idx, etype='b')
+            connected_edge_indices.extend(in_edges[2].tolist())
+            connected_edge_indices.extend(out_edges[2].tolist())
+        
+        # deduplicate
+        connected_edge_indices = list(set(connected_edge_indices))
+        
+        edge_mask = torch.zeros(g.num_edges('b'), dtype=torch.bool)
+        edge_mask[connected_edge_indices] = True
         g.edges['b'].data['mask'] = edge_mask
-        
-        # Apply edge feature masking
-        if edge_mask.any():
-            g.edges['b'].data['x'][edge_mask] = torch.FloatTensor(bond_mask_features())
+        orig_bond_feats = g.edges['b'].data['x'].clone()
+        g.edges['b'].data['x'][edge_mask] = torch.FloatTensor(bond_mask_features())
+
+        # also store the unmasked features for target reconstruction
+        g.edges['b'].data['x_unmasked'] = orig_bond_feats
 
     def _validate_masking_results(self, g: dgl.DGLHeteroGraph, 
                                 orig_atom_feats: torch.Tensor,

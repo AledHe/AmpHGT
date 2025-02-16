@@ -1,22 +1,34 @@
 """
 Main entry for AmpHGT, Train, Fine-Tune, Inference in one go.
+
+===============================================================================
+Copyright (C) 2025 by Yongcheng He
+Center for Sustainable Antimicrobials, Department of Pharmacy, College of Veterinary Medicine
+Sichuan Agricultural University, Chengdu
+
+Licensed under the MIT License.
+See LICENSE file in the project root for full license information.
+===============================================================================
 """
 
 import os
 import mlflow
 import torch.optim as optim
+import shutil
+import argparse
 
 from model.PepMAE import PepMAE
 from utils.read_params import lcfig, Cfig
-from utils.data import make_loaders
+from utils.data_rework import make_pretrain_loaders, make_binary_loaders
 from utils.MaskMethod import MaskGraph
 from utils.std_logger import initialize_logger, info
+from utils.seed_device import setup_seed_reproducibility
 
 from trainers.pretrain_trainer import Masking_Trainer
+from trainers.finetune_trainer import Finetune_Trainer
 
-from model.PharmHGT_refactor import PharmHGT
+from model.PharmHGT_refactor import PharmHGT, PharmHGT_FP, AmpHGT_FT
 # from model.pretrain_heads import PretrainingHeads, PretrainingMetrics, ReconstructionLoss
-from seed_device import setup_seed_reproducibility
 
 """
 Message from 2024/10/24
@@ -41,13 +53,34 @@ PepMAE：
 需要参考新的特征表示方法。
 
 PharmHGT：
-目前的深度够了吗？结构足够好吗？
+目前的深度够了吗？结构足够好吗？参数量足够吗？
 
 目前的训练方法任然不完善。试着运行代码发现了如下问题：
 1. VRAM会逐渐累计直到溢出。（似乎解决了）
 2. Validation epoch还没有进行过测试。
 3. 预测方法可能还需要调整。
 4. 使用MLflow保存模型，目前抛弃了这个方式。
+
+#BUG:
+Random seed的运行方式出问题了，在不同的py文件中，import random似乎会设置独立的random seed。
+必须找到一种方式来保存切割方法FraSCESS。Mask的frag与atom。
+在cfg中提供random。
+# FIXED
+
+#BUG:
+Traceback (most recent call last):
+File "G:/AmpHGT/refactor/amphgt_refactor/main.py", line 189, in <module>
+    pretrain_main()
+File "G:/AmpHGT/refactor/amphgt_refactor/utils/read_params.py", line 100, in wrapper
+    return func(params, *args, **kwargs)
+File "G:/AmpHGT/refactor/amphgt_refactor/main.py", line 179, in pretrain_main
+    trainer.run()
+File "G:/AmpHGT/refactor/amphgt_refactor/trainers/pretrain_trainer.py", line 168, in run
+    self._log_epoch_metrics(train_metrics, val_metrics, epoch)
+File "G:/AmpHGT/refactor/amphgt_refactor/trainers/pretrain_trainer.py", line 191, in _log_epoch_metrics
+    for name, value in val_metrics.items():
+AttributeError: 'NoneType' object has no attribute 'items'
+# FIXED
 
 记录于 2024/10/27
 """
@@ -60,6 +93,9 @@ def pretrain_main(cfg: Cfig):
     ensure_dir_exists(cfg.logger.log_dir)
 
     initialize_logger(cfg.logger.log_dir)
+
+    # copy the config file to the log directory
+    shutil.copy('configs/pretrain.yaml', os.path.join(cfg.logger.log_dir, "pretrain.yaml"))
 
     # Initialize the random seed and device configuration for reproducibility
     devices = setup_seed_reproducibility(cfg.train.seed, cfg.train.cuda_deterministic)
@@ -74,19 +110,17 @@ def pretrain_main(cfg: Cfig):
 
     info("Creating DataLoaders...")
 
-    pretrain_loader, vocab_dict = make_loaders(
+    pretrain_loader, vocab_dict = make_pretrain_loaders(
         cfg, 
         batch_size=cfg.train.batch_size,
-        mask_graph=MaskGraph(
-            num_atom_type=119,
-            num_edge_type=5,
-            mask_edge=cfg.train.mask_edge,
-            mask_atom=cfg.train.mask_atom,
-            mask_fragment=cfg.train.mask_fragment,
-            mask_edge_r=cfg.train.mask_edge_r,
-            mask_atom_r=cfg.train.mask_atom_r,
-            mask_fragment_r=cfg.train.mask_fragment_r
-            )
+        # mask_graph=MaskGraph(
+        #     num_atom_type=119,
+        #     num_edge_type=5,
+        #     mask_edge=cfg.train.mask_edge,
+        #     mask_atom=cfg.train.mask_atom,
+        #     mask_fragment=cfg.train.mask_fragment,
+        #     mask_rate=cfg.train.mask_rate,
+        #     )
         )
 
     info("Setting up model...")
@@ -97,7 +131,8 @@ def pretrain_main(cfg: Cfig):
         cfg.train.atom_dim, 
         cfg.train.bond_dim,
         cfg.train.pharm_dim, 
-        cfg.train.reac_dim).to(devices)
+        cfg.train.reac_dim
+    ).to(devices)
 
     ### New head added 24.10.24
     info("Setting up PepMAE decoder...")
@@ -107,56 +142,17 @@ def pretrain_main(cfg: Cfig):
         atom_feat_dim=cfg.train.atom_dim,
         fragment_feat_dim=cfg.train.pharm_dim,
         num_atom_classes=119,
-        num_fragment_classes=len(vocab_dict)
+        num_fragment_classes=len(vocab_dict),
+        decoder_type=cfg.train.decoder_type
     ).to(devices)
 
     info("Setting up optimizers...")
-    # Combined optimizer for model and pretraining heads
+    # Combined optimizer for encoder and decoder
     optimizer = optim.Adam(
         list(encoder.parameters()) + list(decoder.parameters()),
         lr=cfg.train.lr,
         weight_decay=cfg.train.decay
     )
-    
-    '''
-    info("Setting up linear prediction layers...")
-    linear_pred_atoms = torch.nn.Linear(cfg.train.hid_dim, 119).to(devices)
-    # check if hid_dim at least >= vocab size
-    if cfg.train.hid_dim < len(vocab_dict):
-        info("Warning: hid_dim is less than vocab size. This may lead to underfitting.")
-    if cfg.train.frag_method != "AdaFrag":
-        linear_pred_pharms = torch.nn.Linear(cfg.train.hid_dim, len(vocab_dict)).to(devices)
-    else:
-        linear_pred_pharms = torch.nn.Linear(cfg.train.hid_dim, 264).to(devices)
-    linear_pred_bonds = torch.nn.Linear(cfg.train.hid_dim, 4).to(devices)
-
-    model_list = [
-        model, linear_pred_atoms, linear_pred_pharms, linear_pred_bonds
-    ]
-
-    info("Setting up optimizers...")
-
-    optimizer_model = optim.Adam(model.parameters(),
-                                 lr=cfg.train.lr,
-                                 weight_decay=cfg.train.decay)
-    optimizer_linear_pred_atoms = optim.Adam(linear_pred_atoms.parameters(),
-                                             lr=cfg.train.lr,
-                                             weight_decay=cfg.train.decay)
-    optimizer_linear_pred_pharms = optim.Adam(linear_pred_pharms.parameters(),
-                                              lr=cfg.train.lr,
-                                              weight_decay=cfg.train.decay)
-    optimizer_linear_pred_bonds = optim.Adam(linear_pred_bonds.parameters(),
-                                             lr=cfg.train.lr,
-                                             weight_decay=cfg.train.decay)
-    optimizer_list = [
-        optimizer_model, 
-        optimizer_linear_pred_atoms,
-        optimizer_linear_pred_pharms, 
-        optimizer_linear_pred_bonds
-    ]
-
-    criterion = nn.CrossEntropyLoss()
-    '''
 
     with mlflow.start_run():
         info("Logging hyper-parameters...")
@@ -167,7 +163,7 @@ def pretrain_main(cfg: Cfig):
         info("Initializing trainer...")
         trainer = Masking_Trainer(
             cfg=cfg,
-            dataloaders=pretrain_loader,
+            dataloaders=pretrain_loader, # this is a dict with "train"/"valid"/"test"
             encoder=encoder,
             decoder=decoder,
             optimizer=optimizer,
@@ -180,10 +176,121 @@ def pretrain_main(cfg: Cfig):
 
     info("finished training......")
 
+@lcfig(config_path = 'configs/finetune_binary.yaml', output_dir = "out_finetune_binary")
+def finetune_binary_main(cfg: Cfig):
+    """
+    Main function to fine-tune the model.
+    """
+    ensure_dir_exists(cfg.logger.log_dir)
+
+    initialize_logger(cfg.logger.log_dir)
+
+    # copy the config file to the log directory
+    shutil.copy('configs/finetune_binary.yaml', os.path.join(cfg.logger.log_dir, "finetune_binary.yaml"))
+
+    # Initialize the random seed and device configuration for reproducibility
+    devices = setup_seed_reproducibility(cfg.train.seed, cfg.train.cuda_deterministic)
+
+    # Set up MLflow tracking if enabled
+    if cfg.logger.log:
+        info("Setting up MLflow tracking...")
+        mlflow.set_tracking_uri(cfg.logger.tracking_uri)
+        mlflow.set_experiment(cfg.logger.mlflow_exp_name)
+
+    devices = devices[0]
+
+    info("Creating DataLoaders...")
+
+    finetune_loader, vocab_dict = make_binary_loaders(
+        cfg, 
+        batch_size=cfg.train.batch_size,
+        mask_graph=MaskGraph(
+            num_atom_type=119,
+            num_edge_type=5,
+            mask_edge=cfg.train.mask_edge,
+            mask_atom=cfg.train.mask_atom,
+            mask_fragment=cfg.train.mask_fragment,
+            mask_rate=cfg.train.mask_rate,
+            )
+        )
+    
+    info("Setting up model...")
+    model = PharmHGT_FP(
+        cfg,
+        cfg.train.hid_dim, 
+        cfg.train.act, 
+        cfg.train.num_layer,
+        cfg.train.atom_dim, 
+        cfg.train.bond_dim,
+        cfg.train.pharm_dim, 
+        cfg.train.reac_dim
+    ).to(devices)
+    
+    info("Setting up optimizers...")
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=cfg.train.lr,
+        weight_decay=cfg.train.decay
+    )
+
+    with mlflow.start_run():
+        info("Logging hyper-parameters...")
+        # log hyper-parameters
+        for p, v in cfg.train.items():
+            mlflow.log_param(p, v)
+
+        info("Initializing trainer...")
+        trainer = Finetune_Trainer(
+            cfg=cfg,
+            dataloaders=finetune_loader, # this is a dict with "train"/"valid"/"test"
+            model=model,
+            optimizer=optimizer,
+            device=devices,
+            outputdir=cfg.logger.log_dir
+        )
+        
+        info("Starting training...")
+        trainer.run()
+
+    info("finished training......")
+
+@lcfig(config_path = 'configs/finetune_regression.yaml', output_dir = "out_finetune_regression")
+def finetune_regression_main(cfg: Cfig):
+    pass
+
+@lcfig(config_path = 'configs/inference_binary.yaml', output_dir = "out_inference_binary")
+def inference_binary_main(cfg: Cfig):
+    pass
+
+@lcfig(config_path = 'configs/extract_embeddings_encoder.yaml', output_dir = "out_extract_encoder_embeddings")
+def extract_embeddings_encoder_main(cfg: Cfig):
+    pass
+
+@lcfig(config_path = 'configs/extract_embeddings_amphgt.yaml', output_dir = "out_extract_amphgt_embeddings")
+def extract_embeddings_amphgt_main(cfg: Cfig):
+    pass
+    
 def ensure_dir_exists(path):
     if not os.path.exists(path):
         info(f"Creating: {path}")
         os.makedirs(path)
 
 if __name__ == '__main__':
-    pretrain_main()
+    parser = argparse.ArgumentParser(description='AmpHGT')
+    parser.add_argument('mode', type=str, default='pt', help='Mode to run the program in: pt, ftb, ftr, ifb, fe, fa')
+    args = parser.parse_args()
+
+    if args.mode == 'pt':
+        pretrain_main()
+    elif args.mode == 'ftb':
+        finetune_binary_main()
+    elif args.mode == 'ftr':
+        finetune_regression_main()
+    elif args.mode == 'ifb':
+        inference_binary_main()
+    elif args.mode == 'fe':
+        extract_embeddings_encoder_main()
+    elif args.mode == 'fa':
+        extract_embeddings_amphgt_main()
+    else:
+        raise ValueError(f"Invalid mode: {args.mode}")

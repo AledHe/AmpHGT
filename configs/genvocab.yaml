@@ -1,0 +1,15 @@
+train:
+  train_tag: "generate_vocabdict"
+
+data:
+  vocablist: false
+  dataset: ./tokenizer/pseudo_vocab_gen_sequence.smi
+  tmp_dir: ./tmp/genvocab
+  chunk_size: 2000
+
+logger:
+  test_run: True
+
+mode:
+  nni: false  # If using NNI for hyperparameter tuning
+  ddp: false   # Distributed Data Parallel mode

@@ -1,36 +1,42 @@
 train:
   seed: 42
   log_interval: 5  # Log every 100 steps
-  val_interval: 1000
+  # val_interval: 1000
   cuda_deterministic: False
   mask_edge: False
   mask_atom: True
   mask_fragment: True
-  mask_rate: 0.6 # how many elements in a peptide should be masked.
+  mask_rate: 0.6 # how many atoms in a peptide should be masked.
   batch_size: 64
   hid_dim: 300
   act: "relu"
   depth: 5
-  # num_task: 1
+  num_task: 1
   atom_dim: 42 # do not change
   bond_dim: 14 # do not change
   pharm_dim: 196 # do not change
   reac_dim: 14
   num_layer: 5
+  num_tasks: 1
   lr: 0.001
   decay: 0
   epochs: 10
   patience: 5
   frag_method: "FraSCESS"
-  train_tag: "s1_pretrain"
-  decoder_type: "HGC"
+  train_tag: "s2_finetune"
+  readout: "att" # att: HierAttnReadout, cov: HeteroConvReadout, gru: Node_GRUReadout
+  pooling: "mean" # works when not gru readout, mean, max, sum, concat
+  checkpoint_path: out_pretrain/02-10-19-24/checkpoint_epoch_1_best/model.pt
 
 data:
   vocablist: tokenizer/vocablist/vocab_1.json
-  train_sdf: datasets/
-  valid_sdf: datasets/
-  test_sdf: datasets/
-  tmp_dir: ./tmp/pretrain
+  train_sdf_pos: datasets/positive_train_combined.smi
+  valid_sdf_pos: datasets/positive_val_2480.smi
+  test_sdf_pos: datasets/positive_indetest_2567.smi
+  train_sdf_neg: datasets/negative_train_combined.smi
+  valid_sdf_neg: datasets/negative_val_2763.smi
+  test_sdf_neg: datasets/negative_indetest_1837.smi
+  tmp_dir: ./tmp/finetune_binary
   chunk_size: 2000
   # save_path: "/home/ubuntu/project/amphgt_refactor/datasets/split/pretrain"
   num_workers: 2
@@ -40,7 +46,7 @@ logger:
   log_dir: "${output_dir}/${now:%m-%d-%H-%M}"
   log_per_steps: 5
   tracking_uri: "${output_dir}/mlflow_tracking"
-  mlflow_exp_name: "Pretraining_FraSCESS"
+  mlflow_exp_name: "Finetune_FraSCESS"
   test_run: False
 
 mode:

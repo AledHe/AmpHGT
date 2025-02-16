@@ -6,7 +6,7 @@ train:
   mask_edge: False
   mask_atom: True
   mask_fragment: True
-  mask_rate: 0.6 # how many elements in a peptide should be masked.
+  mask_rate: 0.5 # how many atoms in a peptide should be masked.
   batch_size: 64
   hid_dim: 300
   act: "relu"
@@ -20,18 +20,17 @@ train:
   lr: 0.001
   decay: 0
   epochs: 10
-  patience: 5
   frag_method: "FraSCESS"
   train_tag: "s1_pretrain"
   decoder_type: "HGC"
 
 data:
-  vocablist: tokenizer/vocablist/vocab_1.json
-  train_sdf: datasets/
-  valid_sdf: datasets/
-  test_sdf: datasets/
-  tmp_dir: ./tmp/pretrain
-  chunk_size: 2000
+  vocablist: G:\AmpHGT\refactor\amphgt_refactor\tokenizer\vocablist\vocab_1.json
+  train_sdf: G:\AmpHGT\refactor\amphgt_refactor\datasets\positive_train_9924.smi
+  valid_sdf: G:\AmpHGT\refactor\amphgt_refactor\datasets\positive_val_2480.smi
+  test_sdf: G:\AmpHGT\refactor\amphgt_refactor\datasets\XU_AMP.smi
+  tmp_dir: .\tmp\pretrain
+  chunk_size: 10000
   # save_path: "/home/ubuntu/project/amphgt_refactor/datasets/split/pretrain"
   num_workers: 2
 
@@ -41,7 +40,7 @@ logger:
   log_per_steps: 5
   tracking_uri: "${output_dir}/mlflow_tracking"
   mlflow_exp_name: "Pretraining_FraSCESS"
-  test_run: False
+  test_run: True
 
 mode:
   nni: false  # If using NNI for hyperparameter tuning

@@ -23,7 +23,7 @@ train:
   patience: 5
   frag_method: "FraSCESS"
   train_tag: "s1_pretrain"
-  decoder_type: "HGC"
+  decoder_type: "HGC" # MLP, HGC, HAN
 
 data:
   vocablist: tokenizer/vocablist/vocab_1.json

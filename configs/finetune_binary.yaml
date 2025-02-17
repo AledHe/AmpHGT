@@ -20,12 +20,13 @@ train:
   num_tasks: 1
   lr: 0.001
   decay: 0
-  epochs: 10
+  epochs: 200
   patience: 5
   frag_method: "FraSCESS"
   train_tag: "s2_finetune"
-  readout: "att" # att: HierAttnReadout, cov: HeteroConvReadout, gru: Node_GRUReadout
-  pooling: "mean" # works when not gru readout, mean, max, sum, concat
+  load_pretrained: True # if not, train from scratch on finetune data
+  readout: "att" # "att": HierAttnReadout, "gru": GRUReadout, "": no readout
+  pooling: "mean" # works when not gru/att readout, mean, max, sum
   checkpoint_path: out_pretrain/02-10-19-24/checkpoint_epoch_1_best/model.pt
 
 data:

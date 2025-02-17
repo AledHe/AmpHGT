@@ -415,48 +415,65 @@ def make_pretrain_loaders(cfg, batch_size):
     
     return dataloaders, train_dataset.vocab_dict
 
-def make_binary_loaders(cfg, batch_size, mask_graph):
-    # 1) Create datasets for each split
-    train_dataset = FinetuneDataLoader(cfg, "train", mask_graph)
-    
-    if cfg.logger.test_run:
-        valid_dataset = train_dataset
-        test_dataset = train_dataset
+def make_binary_loaders(cfg, batch_size, mask_graph, inference=False):
+    if not inference:
+        # 1) Create datasets for each split
+        train_dataset = FinetuneDataLoader(cfg, "train", mask_graph)
+        
+        if cfg.logger.test_run:
+            valid_dataset = train_dataset
+            test_dataset = train_dataset
+        else:
+            valid_dataset = FinetuneDataLoader(cfg, "valid", mask_graph)
+            test_dataset  = FinetuneDataLoader(cfg, "test", mask_graph)
+
+        # 2) Wrap them in PyTorch DataLoaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=cfg.data.num_workers,
+            pin_memory=True,
+            shuffle=True
+        )
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=cfg.data.num_workers,
+            pin_memory=True
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=cfg.data.num_workers,
+            pin_memory=True
+        )
+
+        # 3) Return the loaders plus the vocabulary from one of them (or a consistent place)
+        dataloaders = {
+            "train": train_loader,
+            "valid": valid_loader,
+            "test": test_loader
+        }
+
     else:
-        valid_dataset = FinetuneDataLoader(cfg, "valid", mask_graph)
-        test_dataset  = FinetuneDataLoader(cfg, "test", mask_graph)
+        info("Inference mode. Loading test dataset only.")
+        test_dataset = FinetuneDataLoader(cfg, "test", mask_graph)
 
-    # 2) Wrap them in PyTorch DataLoaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        collate_fn=collate_fn,
-        num_workers=cfg.data.num_workers,
-        pin_memory=True,
-        shuffle=True
-    )
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=batch_size,
-        collate_fn=collate_fn,
-        num_workers=cfg.data.num_workers,
-        pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        collate_fn=collate_fn,
-        num_workers=cfg.data.num_workers,
-        pin_memory=True
-    )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=cfg.data.num_workers,
+            pin_memory=True
+        )
 
-    # 3) Return the loaders plus the vocabulary from one of them (or a consistent place)
-    dataloaders = {
-        "train": train_loader,
-        "valid": valid_loader,
-        "test": test_loader
-    }
-    
+        dataloaders = {
+            "test": test_loader
+        }
+        
     return dataloaders, train_dataset.vocab_dict
 
 def make_regression_loaders(cfg, batch_size):

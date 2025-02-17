@@ -334,7 +334,7 @@ class PharmHGT_FP(nn.Module):
     """
     PharmHGT pretrained pooling. FP: From Pretrained.
     """
-    def __init__(self, cfg, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, load_pretrained):
+    def __init__(self, cfg, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, device, load_pretrained):
         super(PharmHGT_FP,self).__init__()
         self.cfg = cfg
         self.act = get_func(act)
@@ -369,8 +369,22 @@ class PharmHGT_FP(nn.Module):
         self.mlp = MLP(hid_dim, num_classes=cfg.train.num_tasks, readout=self.readout)
 
         self.initialize_weights()
-        
-        self.pretrain_model = None
+
+        self.pretrain_model = self.load_model(
+            checkpoint_path=self.cfg.train.checkpoint_path,
+            hid_dim=self.output_dim,
+            act=self.act,
+            depth=self.depth,
+            atom_dim=self.atom_dim,
+            bond_dim=self.bond_dim,
+            pharm_dim=self.pharm_dim,
+            reac_dim=self.reac_dim,
+            device=device
+        )
+
+        if not load_pretrained:
+            # init again, this will retrain PharmHGT on finetune data.
+            self.initialize_weights()
 
     def initialize_weights(self):
         for param in self.parameters():
@@ -427,26 +441,15 @@ class PharmHGT_FP(nn.Module):
         return model
     
     def forward(self, bg):
-        if not self.pretrain_model:
-            # loading model
-            model = self.load_model(
-                checkpoint_path=self.cfg.train.checkpoint_path,
-                hid_dim=self.output_dim,
-                act=self.act,
-                depth=self.depth,
-                atom_dim=self.atom_dim,
-                bond_dim=self.bond_dim,
-                pharm_dim=self.pharm_dim,
-                reac_dim=self.reac_dim,
-                device=bg.device
-            )
-            self.pretrain_model = model
-
         # embedding extraction
-        with torch.no_grad():
+        if self.load_pretrained:
+            # do not mess up the pretrained model
+            with torch.no_grad():
+                bg = self.pretrain_model(bg, finetune=True)
+                # embed_f_a = bg.nodes['a'].data['f_h'] torch.Size([26623, 300])
+                # embed_f_p = bg.nodes['p'].data['f_h'] torch.Size([6775, 300])
+        else:
             bg = self.pretrain_model(bg, finetune=True)
-            # embed_f_a = bg.nodes['a'].data['f_h'] torch.Size([26623, 300])
-            # embed_f_p = bg.nodes['p'].data['f_h'] torch.Size([6775, 300])
 
         # if readout
         if self.readout:

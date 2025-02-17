@@ -224,6 +224,7 @@ def finetune_binary_main(cfg: Cfig):
         cfg.train.bond_dim,
         cfg.train.pharm_dim, 
         cfg.train.reac_dim,
+        devices,
         cfg.train.load_pretrained
     ).to(devices)
     
@@ -261,7 +262,42 @@ def finetune_regression_main(cfg: Cfig):
 
 @lcfig(config_path = 'configs/inference_binary.yaml', output_dir = "out_inference_binary")
 def inference_binary_main(cfg: Cfig):
-    pass
+    """
+    Main function to inference with binary targets.
+    """
+    ensure_dir_exists(cfg.logger.log_dir)
+
+    initialize_logger(cfg.logger.log_dir)
+
+    # copy the config file to the log directory
+    shutil.copy('configs/inference_binary.yaml', os.path.join(cfg.logger.log_dir, "inference_binary.yaml"))
+
+    # Initialize the random seed and device configuration for reproducibility
+    devices = setup_seed_reproducibility(cfg.train.seed, cfg.train.cuda_deterministic)
+
+    # Set up MLflow tracking if enabled
+    if cfg.logger.log:
+        info("Setting up MLflow tracking...")
+        mlflow.set_tracking_uri(cfg.logger.tracking_uri)
+        mlflow.set_experiment(cfg.logger.mlflow_exp_name)
+
+    devices = devices[0]
+
+    info("Creating DataLoaders...")
+
+    inference_loader, vocab_dict = make_binary_loaders(
+        cfg, 
+        batch_size=cfg.train.batch_size,
+        mask_graph=MaskGraph(
+            num_atom_type=119,
+            num_edge_type=5,
+            mask_edge=cfg.train.mask_edge,
+            mask_atom=cfg.train.mask_atom,
+            mask_fragment=cfg.train.mask_fragment,
+            mask_rate=cfg.train.mask_rate,
+            ),
+        inference=True
+    ) # inference loader only load test path data.
 
 @lcfig(config_path = 'configs/extract_embeddings_encoder.yaml', output_dir = "out_extract_encoder_embeddings")
 def extract_embeddings_encoder_main(cfg: Cfig):

@@ -366,7 +366,7 @@ class PharmHGT_FP(nn.Module):
         if self.readout:
             self.pooling = None
         
-        self.mlp = MLP(hid_dim, num_classes=cfg.train.num_tasks)
+        self.mlp = MLP(hid_dim, num_classes=cfg.train.num_tasks, readout=self.readout)
 
         self.initialize_weights()
         

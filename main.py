@@ -223,7 +223,8 @@ def finetune_binary_main(cfg: Cfig):
         cfg.train.atom_dim, 
         cfg.train.bond_dim,
         cfg.train.pharm_dim, 
-        cfg.train.reac_dim
+        cfg.train.reac_dim,
+        cfg.train.load_pretrained
     ).to(devices)
     
     info("Setting up optimizers...")

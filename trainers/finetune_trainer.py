@@ -69,7 +69,7 @@ class Finetune_Trainer(object):
             logits = self.model(batch)
 
             # Compute loss
-            loss = self.criterion(logits, label.float())  # shape [batch_size]
+            loss = self.criterion(logits, label.unsqueeze(1))  # shape [batch_size]
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -105,11 +105,12 @@ class Finetune_Trainer(object):
 
                 # Forward pass through encoder (PharmHGT_FP with pooling), returns bg_embeds.
                 logits = self.model(batch)
-                logits = torch.sigmoid(logits)
 
                 # Compute loss
-                loss = self.criterion(logits, label.float())
+                loss = self.criterion(logits, label.unsqueeze(1))
                 total_loss += loss.item()
+
+                logits = torch.sigmoid(logits) # convert logits to probabilities
 
                 all_preds.append(logits.cpu())
                 all_trues.append(label.cpu())
@@ -146,8 +147,10 @@ class Finetune_Trainer(object):
                 break
 
             val_metrics = self.eov_epoch("valid")
+            intrain_test_metrics = self.eov_epoch(stage='test')
 
             self._log_epoch_metrics(train_metrics=None, val_metrics=val_metrics, test_metrics=None, epoch=epoch)
+            self._log_epoch_metrics(train_metrics=None, val_metrics=None, test_metrics=intrain_test_metrics, epoch=epoch)
 
             # Model selection and early stopping
             if val_metrics['mcc'] > self.best_mcc:

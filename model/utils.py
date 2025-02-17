@@ -13,7 +13,7 @@ def compute_need_metrics(pred, target):
     target_labels = target.int().cpu()
     
     # 计算accuracy
-    accuracy = (pred_labels == target_labels).float().mean().item()
+    accuracy = accuracy_score(target_labels, pred_labels)
 
     # 计算precision, recall (sensitivity), specificity, F1 score
     precision = precision_score(target_labels, pred_labels, average='binary')
@@ -56,5 +56,8 @@ func_dict={'relu':nn.ReLU(),
            }
 
 def get_func(fn_name):
+    # check if fn_name is already a function
+    if callable(fn_name):
+        return fn_name
     fn_name = fn_name.lower()
     return func_dict[fn_name]

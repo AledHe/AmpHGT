@@ -4,55 +4,96 @@ import torch
 import dgl
 import dgl.nn.pytorch as dglnn
 
-from torch import nn, scatter
+from torch import nn
+from torch_scatter import scatter
 from torch.nn import functional as F
+
+from utils.std_logger import error
 
 # First, we run the effect of the multi-view GNN itself and make a global mean pooling as a baseline; 
 # then we add a Cross-Attn readout that only performs self-attention on (a, p) for comparison.
 # be careful with batched graphs, readout require batch splitting.
 
+class Permute(nn.Module):
+    """ Utility to permute a B x N x D tensor into B x D x N. """
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return torch.permute(x, (0, 2, 1))
+
+class Squeeze(nn.Module):
+    """ Utility to squeeze a given dimension. """
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+    def forward(self, x):
+        return torch.squeeze(x, dim=self.dim)
+    
+def split_batch(bg: dgl.DGLHeteroGraph, ntype: str, field: str, device=None):
+    """
+    1) Gather node embeddings for a type ntype.
+    2) Split by each subgraph in bg (bg.batch_size many) into sub-tensors.
+    3) Zero-pad them to the same dimension (max # of nodes among subgraphs).
+    4) Return shape: (B, max_num_nodes, hidden_dim).
+    """
+    hidden = bg.nodes[ntype].data[field]   # shape (N, d_model)
+    if device is None:
+        device = hidden.device
+
+    node_size = bg.batch_num_nodes(ntype)  # shape (B,)
+    start_index = torch.cat([
+        torch.tensor([0], device=device),
+        torch.cumsum(node_size, dim=0)[:-1]
+    ])
+
+    max_num_node = int(node_size.max())
+    hidden_lst = []
+    for i in range(bg.batch_size):
+        start = start_index[i]
+        size = node_size[i]
+        # gather sub-tensor
+        cur_hidden = hidden.narrow(0, start, size)
+        # zero-pad to (max_num_node, d_model)
+        pad_len = max_num_node - size
+        if pad_len > 0:
+            pad = torch.zeros(pad_len, cur_hidden.size(1), device=device)
+            cur_hidden = torch.cat([cur_hidden, pad], dim=0)
+        # shape: (max_num_node, d_model)
+        hidden_lst.append(cur_hidden.unsqueeze(0))
+
+    # final shape: (B, max_num_node, d_model)
+    hidden_cat = torch.cat(hidden_lst, dim=0)
+    return hidden_cat
+
 class GlobalPooling(nn.Module):
     def __init__(self, mode='mean'):
         super().__init__()
         self.mode = mode.lower()
-        assert self.mode in ['mean', 'sum', 'max', 'concat']
-
-    def batch_pool(self, bg: dgl.DGLHeteroGraph, ntype, feat_name):
-        with bg.local_scope():
-            # get batch number of nodes
-            batch_num_nodes = bg.batch_num_nodes(ntype)
-            
-            # handle empty graphs
-            if batch_num_nodes.sum() == 0:
-                return torch.zeros(bg.batch_size, bg.nodes[ntype].data[feat_name].shape[-1]).to(bg.device)
-            
-            # global pooling
-            if self.mode == 'mean':
-                pooled = dgl.mean_nodes(bg, ntype, feat_name)
-            elif self.mode == 'sum':
-                pooled = dgl.sum_nodes(bg, ntype, feat_name)
-            elif self.mode == 'max':
-                pooled = dgl.max_nodes(bg, ntype, feat_name)
-            
-            # handle empty graphs
-            mask = (batch_num_nodes == 0)
-            pooled[mask] = 0
-            return pooled
-
-    def forward(self, bg: dgl.DGLHeteroGraph, suffix='h'):
-        # global pooling
-        a_embed = self.batch_pool(bg, 'a', f'f_{suffix}')
-        p_embed = self.batch_pool(bg, 'p', f'f_{suffix}')
-        
-        if self.mode == 'concat':
-            return torch.cat([a_embed, p_embed], dim=-1)
+        assert self.mode in ['mean', 'sum', 'max']
+    
+    def batch_pool(self, bg: dgl.DGLHeteroGraph, ntype: str, feat_name: str) -> torch.Tensor:
+        """
+        Pool the node features of type ntype in a batched graph bg.
+        Returns a tensor of shape (batch_size, hidden_dim).
+        """
+        # node_feats shape: (Total # nodes of type ntype in batch, hidden_dim)
+        if self.mode == 'mean':
+            pooled = dgl.mean_nodes(bg, feat_name, ntype=ntype)
+        elif self.mode == 'sum':
+            pooled = dgl.sum_nodes(bg, feat_name, ntype=ntype)
         elif self.mode == 'max':
-            # perform element-level max pooling on a_embed and p_embed again
-            # after stack => [2, B, hid_dim], then perform max on dim=0 => [B, hid_dim]
-            return torch.max(torch.stack([a_embed, p_embed], dim=0), dim=0)[0]
+            pooled = dgl.max_nodes(bg, feat_name, ntype=ntype)
         else:
-            # for 'mean' and 'sum', here is (a + p) / 2, can also change it to a + p
-            return (a_embed + p_embed) / 2
+            error(f'Invalid pooling mode: {self.mode}')
+        return pooled
+    
+    def forward(self, bg: dgl.DGLHeteroGraph, suffix='h'):
+        feat_name = f'f_{suffix}'
+
+        a_embed = self.batch_pool(bg, 'a', feat_name)  # (B, D)
+        p_embed = self.batch_pool(bg, 'p', feat_name)  # (B, D)
+
+        return a_embed + p_embed # (B, D)
     
 class HierAttnReadout(nn.Module):
     def __init__(self, hid_dim):
@@ -108,59 +149,3 @@ class HierAttnReadout(nn.Module):
         # 3) ============= Cross-view fusion =============
         combined = torch.cat([a_embed, p_embed], dim=-1)  # [B, 2*hid_dim]
         return self.cross_proj(combined)                  # [B, hid_dim]
-
-class HeteroConvReadout(nn.Module):
-    def __init__(self, 
-                 hidden_dim, 
-                 num_layers=2,
-                 agg_type='mean' # mean, sum, max
-                 ):
-        super().__init__()
-        # 1) Define heterogeneous convolution. For each edge type, give a GraphConv.
-        self.convs = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        self.num_layers = num_layers
-
-        for _ in range(num_layers):
-            conv = dglnn.HeteroGraphConv({
-                ('a', 'b', 'a'): dglnn.GraphConv(hidden_dim, hidden_dim),
-                ('p', 'r', 'p'): dglnn.GraphConv(hidden_dim, hidden_dim),
-                ('a', 'j', 'p'): dglnn.GraphConv(hidden_dim, hidden_dim),
-                ('p', 'j', 'a'): dglnn.GraphConv(hidden_dim, hidden_dim)
-            }, aggregate=agg_type)
-            self.convs.append(conv)
-
-            # Layer Normalization
-            self.norms.append(nn.ModuleDict({
-                'a': nn.LayerNorm(hidden_dim),
-                'p': nn.LayerNorm(hidden_dim)
-            }))
-
-        self.linear_a = nn.Linear(hidden_dim, hidden_dim)
-        self.linear_p = nn.Linear(hidden_dim, hidden_dim)
-    
-    def forward(self, bg: dgl.DGLHeteroGraph, suffix='h'):
-        for layer_idx in range(self.num_layers):
-            h_dict = {'a': bg.nodes['a'].data[f'f_{suffix}'],
-                      'p': bg.nodes['p'].data[f'f_{suffix}']}
-            
-            out_dict = self.convs[layer_idx](bg, h_dict)
-            # out_dict contains the updated representation of each node type
-
-            for ntype in out_dict:
-                out_dict[ntype] = self.norms[layer_idx][ntype](out_dict[ntype])
-                out_dict[ntype] = F.relu(out_dict[ntype])
-
-            # update graph node representation
-            bg.nodes['a'].data[f'f_{suffix}'] = out_dict['a']
-            bg.nodes['p'].data[f'f_{suffix}'] = out_dict['p']
-
-        with bg.local_scope():
-            a_feat = bg.nodes['a'].data[f'f_{suffix}']
-            p_feat = bg.nodes['p'].data[f'f_{suffix}']
-            a_feat = self.linear_a(a_feat)
-            p_feat = self.linear_p(p_feat)
-            bg.nodes['a'].data[f'f_{suffix}'] = a_feat
-            bg.nodes['p'].data[f'f_{suffix}'] = p_feat
-
-        return bg # for further pooling.

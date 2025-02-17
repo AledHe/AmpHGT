@@ -9,7 +9,7 @@ import copy
 import math
 from model.utils import get_func
 from utils.std_logger import info
-from .readouts import GlobalPooling, HierAttnReadout, HeteroConvReadout
+from .readouts import GlobalPooling, HierAttnReadout
 
 # dgl graph utils
 def reverse_edge(tensor):
@@ -334,7 +334,7 @@ class PharmHGT_FP(nn.Module):
     """
     PharmHGT pretrained pooling. FP: From Pretrained.
     """
-    def __init__(self, cfg, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim):
+    def __init__(self, cfg, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, load_pretrained):
         super(PharmHGT_FP,self).__init__()
         self.cfg = cfg
         self.act = get_func(act)
@@ -344,13 +344,14 @@ class PharmHGT_FP(nn.Module):
         self.bond_dim = bond_dim
         self.pharm_dim = pharm_dim
         self.reac_dim = reac_dim
+        self.load_pretrained = load_pretrained
 
         if self.cfg.train.readout == 'att':
             self.readout = HierAttnReadout(hid_dim)
-        elif self.cfg.train.readout == 'cov':
-            self.readout = HeteroConvReadout(hid_dim)
         elif self.cfg.train.readout == 'gru':
-            self.readout = Node_GRUReadout(hid_dim)
+            self.readout = GRUReadout(hid_dim)
+        elif self.cfg.train.readout == 'none':
+            self.readout = None
 
         if self.cfg.train.pooling == 'mean':
             self.pooling = GlobalPooling('mean')
@@ -358,18 +359,18 @@ class PharmHGT_FP(nn.Module):
             self.pooling = GlobalPooling('sum')
         elif self.cfg.train.pooling == 'max':
             self.pooling = GlobalPooling('max')
-        elif self.cfg.train.pooling == 'concat':
-            self.pooling = GlobalPooling('concat')
         else:
             raise ValueError(f"Invalid pooling method: {self.cfg.train.pooling}")
         
-        # if gru readout, remove the pooling layer
-        if self.cfg.train.readout == 'gru':
+        # if readout, remove the pooling layer
+        if self.readout:
             self.pooling = None
         
-        self.mlp = MLP(hid_dim, num_classes=cfg.train.num_tasks, readout=self.cfg.train.readout)
+        self.mlp = MLP(hid_dim, num_classes=cfg.train.num_tasks)
 
         self.initialize_weights()
+        
+        self.pretrain_model = None
 
     def initialize_weights(self):
         for param in self.parameters():
@@ -404,6 +405,10 @@ class PharmHGT_FP(nn.Module):
         )
         model.to(device)
 
+        if not self.load_pretrained:
+            info("No pretrained model loaded. Start training from scratch.")
+            return model
+        
         # model save code
         # torch.save({
         #     'epoch': epoch,
@@ -422,37 +427,39 @@ class PharmHGT_FP(nn.Module):
         return model
     
     def forward(self, bg):
-
-        # loading model
-        model = self.load_model(
-            checkpoint_path=self.cfg.train.checkpoint_path,
-            hid_dim=self.output_dim,
-            act=self.act,
-            depth=self.depth,
-            atom_dim=self.atom_dim,
-            bond_dim=self.bond_dim,
-            pharm_dim=self.pharm_dim,
-            reac_dim=self.reac_dim,
-            device=bg.device
-        )
+        if not self.pretrain_model:
+            # loading model
+            model = self.load_model(
+                checkpoint_path=self.cfg.train.checkpoint_path,
+                hid_dim=self.output_dim,
+                act=self.act,
+                depth=self.depth,
+                atom_dim=self.atom_dim,
+                bond_dim=self.bond_dim,
+                pharm_dim=self.pharm_dim,
+                reac_dim=self.reac_dim,
+                device=bg.device
+            )
+            self.pretrain_model = model
 
         # embedding extraction
         with torch.no_grad():
-            bg = model(bg, finetune=True)
+            bg = self.pretrain_model(bg, finetune=True)
+            # embed_f_a = bg.nodes['a'].data['f_h'] torch.Size([26623, 300])
+            # embed_f_p = bg.nodes['p'].data['f_h'] torch.Size([6775, 300])
 
         # if readout
         if self.readout:
             bg = self.readout(bg)
 
         # pooling
-        if self.pooling != "gru":
+        if self.pooling:
             bg_embeds = self.pooling(bg)  # => shape [B, hid_dim]
         else:
-            bg_embeds = bg # bg by gru readout is a graph_embed
+            bg_embeds = bg # bg by att readout is a graph_embed
 
         # mlp
-        if bg_embeds:
-            logits = self.mlp(bg_embeds)  # => shape [B, num_classes]
+        logits = self.mlp(bg_embeds)  # => shape [B, num_classes]
 
         return logits # shape [B, 1] for binary classification
     
@@ -460,24 +467,23 @@ class MLP(nn.Module):
     """feed bg_embeds to MLP and give binary classification, note that num_classes=1"""
     def __init__(self, hid_dim, num_classes, readout):
         super(MLP,self).__init__()
-        if readout == 'gru':
-            self.fst_layer = nn.Linear(2*hid_dim, hid_dim)
+        if readout == 'gru':  # bidirectional
+            input_dim = 2 * hid_dim
         else:
-            self.fst_layer = nn.Linear(hid_dim, hid_dim)
+            input_dim = hid_dim
+            
         self.mlp = nn.Sequential(
-            self.fst_layer,
-            nn.LayerNorm(hid_dim),
+            nn.Linear(input_dim, hid_dim),  # [600 → 300]
             nn.ReLU(),
-            nn.Dropout(p=0.1),
             nn.Linear(hid_dim, hid_dim // 2),
             nn.ReLU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(hid_dim // 2, num_classes)
+            nn.Linear(hid_dim//2, num_classes)
         )
-    def forward(self,bg_embeds):
+
+    def forward(self, bg_embeds):
         return self.mlp(bg_embeds)
     
-class Node_GRUReadout(nn.Module):
+class GRUReadout(nn.Module):
     """
     Use explicit length-based Mask instead of judging whether the feature is 0.
     - Split the 'a' and 'p' nodes into (B, Lx, D) forms respectively;

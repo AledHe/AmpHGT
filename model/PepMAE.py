@@ -129,9 +129,76 @@ class HeteroConv(nn.Module):
         return feature_decodes, class_decodes
 
 class HeteroAttNet(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        pass
+    def __init__(self,
+                 hidden_dim: int,
+                 atom_feat_dim: int,
+                 fragment_feat_dim: int,
+                 num_atom_classes: int,
+                 num_fragment_classes: int,
+                 num_layers=2,
+                 num_heads=4
+                 ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.hidden_dim = hidden_dim
+        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
+        self.head_dim = hidden_dim // num_heads
+
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.num_layers = num_layers
+
+        for _ in range(num_layers):
+            conv = dglnn.HeteroGraphConv({
+                ('a', 'b', 'a'): dglnn.GATConv(hidden_dim, self.head_dim, num_heads),
+                ('p', 'r', 'p'): dglnn.GATConv(hidden_dim, self.head_dim, num_heads),
+                ('a', 'j', 'p'): dglnn.GATConv(hidden_dim, self.head_dim, num_heads),
+                ('p', 'j', 'a'): dglnn.GATConv(hidden_dim, self.head_dim, num_heads)
+            }, aggregate='mean')
+            self.convs.append(conv)
+
+            # Layer Normalization
+            self.norms.append(nn.ModuleDict({
+                'a': nn.LayerNorm(hidden_dim),
+                'p': nn.LayerNorm(hidden_dim)
+            }))
+
+        # Decoder layers
+        self.atom_feat_decoder = nn.Linear(hidden_dim, atom_feat_dim)
+        self.frag_feat_decoder = nn.Linear(hidden_dim, fragment_feat_dim)
+
+        # Classifiers
+        self.atom_classifier = nn.Linear(hidden_dim, num_atom_classes)
+        self.frag_classifier = nn.Linear(hidden_dim, num_fragment_classes)
+
+    def forward(self, bg):
+        h = {
+            'a': bg.nodes['a'].data['f_h'],
+            'p': bg.nodes['p'].data['f_h']
+        }
+
+        for i in range(self.num_layers):
+            # Apply GAT convolution
+            h_update = self.convs[i](bg, h)
+            
+            # Residual connection and layer norm
+            h = {
+                'a': self.norms[i]['a'](h['a'] + F.relu(h_update['a'])),
+                'p': self.norms[i]['p'](h['p'] + F.relu(h_update['p']))
+            }
+
+        # Decode features and classify
+        feature_decodes = {
+            'atom': self.atom_feat_decoder(h['a'][bg.nodes['a'].data['mask'] == True]),
+            'fragment': self.frag_feat_decoder(h['p'][bg.nodes['p'].data['mask'] == True])
+        }
+
+        class_decodes = {
+            'atom': self.atom_classifier(h['a'][bg.nodes['a'].data['mask'] == True]),
+            'fragment': self.frag_classifier(h['p'][bg.nodes['p'].data['mask'] == True])
+        }
+
+        return feature_decodes, class_decodes
 
 class PepMAE(nn.Module):
     """
@@ -158,7 +225,6 @@ class PepMAE(nn.Module):
         elif decoder_type == "HGC":
             self.decoder = HeteroConv(hidden_dim, atom_feat_dim, fragment_feat_dim, num_atom_classes, num_fragment_classes)
         elif decoder_type == "HAN":
-            # not implemented
             self.decoder = HeteroAttNet(hidden_dim, atom_feat_dim, fragment_feat_dim, num_atom_classes, num_fragment_classes)
         else:
             raise ValueError(f"Decoder type {decoder_type} not supported.")
@@ -170,7 +236,7 @@ class PepMAE(nn.Module):
                 ):
         if self.decoder_type == "MLP":
             return self.decoder(bg, atom_mask, fragment_mask)
-        elif self.decoder_type == "HGC":
+        else:
             return self.decoder(bg)
 
 class PepMAELoss(nn.Module):

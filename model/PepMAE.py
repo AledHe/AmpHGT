@@ -180,6 +180,9 @@ class HeteroAttNet(nn.Module):
         for i in range(self.num_layers):
             # Apply GAT convolution
             h_update = self.convs[i](bg, h)
+
+            # flatten the output to [N, hidden_dim]
+            h_update = {ntype: feat.flatten(1) for ntype, feat in h_update.items()}
             
             # Residual connection and layer norm
             h = {

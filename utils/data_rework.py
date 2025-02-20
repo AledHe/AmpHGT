@@ -10,10 +10,12 @@ import random
 import lz4.frame
 
 import torch
+import pickle
 import dgl
 
 from .FraSCESS.mol2heterograph_FraSCESS import mol2heterograph_frascess
 from .RegularMethod.BRICSFrag import mol2heterograph_BRICS
+from model.sequence_embedding import parse_sequence, encode_sequence, TOKEN2ID
 
 from rdkit import Chem
 from torch.utils.data import Dataset, DataLoader, IterableDataset
@@ -31,11 +33,6 @@ from tqdm import tqdm
 
 #TODO: implement a new streaming dataloader class for pretraining.
 #TODO: implement label logic for regression tasks. (Solub, MIC)
-
-class RegressionDataLoader(Dataset):
-    def __init__(self):
-        super().__init__()
-        pass
 
 class PretrainDataLoader(IterableDataset):
     """
@@ -163,6 +160,8 @@ class FinetuneDataLoader(Dataset):
         #  - e.g., test  -> [test_sdf_pos, test_sdf_neg]
         self.sdf_paths = self.split_path(stage)
 
+        self.fasta_dict = self.load_fasta()
+
         if cfg.train.train_tag == "generate_vocabdict":
             info("Vocab generation mode. Skipping graph processing.")
             # Just load raw molecules (SMILES) for the entire set
@@ -174,6 +173,18 @@ class FinetuneDataLoader(Dataset):
             self.graphs_labels = []
             for sdf_path in self.sdf_paths:
                 self.graphs_labels.extend(self.mol_to_heterograph(sdf_path))
+
+    def load_fasta(self):
+        """
+        load all fasta in the fasta folder for sequence/title lookup.
+        """
+        # find all fasta files in the fasta folder, get path
+        fasta_files = [os.path.join("fasta", f) for f in os.listdir("fasta") if f.endswith(".fasta")]
+        # read all fasta files into a dict
+        fasta_dict = {}
+        for fasta_file in fasta_files:
+            fasta_dict.update(read_fasta(fasta_file))
+        return fasta_dict
 
     def split_path(self, stage):
         """
@@ -214,12 +225,12 @@ class FinetuneDataLoader(Dataset):
         cache_files = sorted(os.listdir(cache_dir))
         if cache_files:
             info(f"Loading cached graphs from {cache_dir}...")
-            return self.load_graphs(cache_dir)
+            return load_graphs(cache_dir)
 
         # If no cache exists, process the graphs and save them
         info(f"No cached graphs found in {cache_dir}. Processing {sdf_path} and caching results...")
         self.save_cache(sdf_path, self.vocab_dict, cache_dir)
-        return self.load_graphs(cache_dir)
+        return load_graphs(cache_dir)
     
     def save_cache(self, sdf_path, vocab_dict, cache_dir, chunk_size=500):
         """
@@ -240,12 +251,18 @@ class FinetuneDataLoader(Dataset):
         chunk_idx = 0
         graphs_batch = []
         labels_batch = []
+        fasta_seq_batch = []
 
         # if cfg defined chunk_size, use it, otherwise use the default value
         if self.cfg.data.chunk_size:
             chunk_size = self.cfg.data.chunk_size
 
         for idx, mol in enumerate(tqdm(mols, desc="Processing molecules", unit="mol")):
+            # retrieve fasta seq using mol.GetProp("_Name")
+            fasta_seq = self.fasta_dict.get(mol.GetProp("_Name"), None)
+            if not fasta_seq:
+                warning(f"Missing fasta sequence for {mol.GetProp('_Name')}")
+                continue
             # Create graph for the molecule based on selected fragmentation method
             if self.cfg.train.frag_method == "FraSCESS":
                 g = mol2heterograph_frascess(mol, mol.GetProp("_Name"), vocab_dict)
@@ -267,6 +284,7 @@ class FinetuneDataLoader(Dataset):
 
             graphs_batch.append(g)
             labels_batch.append(label)
+            fasta_seq_batch.append(fasta_seq)
 
             # If the batch size reaches chunk_size, save it to disk
             if len(graphs_batch) >= chunk_size:
@@ -278,7 +296,14 @@ class FinetuneDataLoader(Dataset):
                 # print detailed information of the first graph
                 # print(graphs_batch[0].ndata)
                 chunk_filename = os.path.join(cache_dir, f"graphs_{self.stage}_chunk_{chunk_idx}.bin")
-                dgl.save_graphs(chunk_filename, graphs_batch, {"labels": torch.tensor(labels_batch)})
+                fasta_tensor = torch.tensor(list(pickle.dumps(fasta_seq_batch)), dtype=torch.uint8)
+
+                save_labels = {
+                    "labels": torch.tensor(labels_batch),
+                    "fasta_pickle": fasta_tensor
+                }
+
+                dgl.save_graphs(chunk_filename, graphs_batch, save_labels)
                 # Compress the .bin file using LZ4
                 with open(chunk_filename, 'rb') as f_in:
                     with open(chunk_filename + '.lz4', 'wb') as f_out:
@@ -288,47 +313,25 @@ class FinetuneDataLoader(Dataset):
                 chunk_idx += 1
                 graphs_batch = []  # Reset batch for next chunk
                 labels_batch = []
+                fasta_seq_batch = []
 
         # Save any remaining graphs that didn't reach chunk_size
         if graphs_batch:
             chunk_filename = os.path.join(cache_dir, f"graphs_{self.stage}_chunk_{chunk_idx}.bin")
-            dgl.save_graphs(chunk_filename, graphs_batch, {"labels": torch.tensor(labels_batch)})
+            fasta_tensor = torch.tensor(list(pickle.dumps(fasta_seq_batch)), dtype=torch.uint8)
+
+            save_labels = {
+                "labels": torch.tensor(labels_batch),
+                "fasta_pickle": fasta_tensor
+            }
+
+            dgl.save_graphs(chunk_filename, graphs_batch, save_labels)
             # Compress the .bin file using LZ4
             with open(chunk_filename, 'rb') as f_in:
                 with open(chunk_filename + '.lz4', 'wb') as f_out:
                     f_out.write(lz4.frame.compress(f_in.read(), compression_level=8))
             os.remove(chunk_filename)
             info(f"Saved final chunk {chunk_idx} with {len(graphs_batch)} graphs.")
-
-    def load_graphs(self, cache_dir):
-        """
-        Load all graph chunks from the cache directory.
-
-        Args:
-        - cache_dir (str): Directory containing the saved graph chunks.
-
-        Returns:
-        - List of (graph, label) tuples
-        """
-        graphs_labels = []
-
-        # Iterate through all chunk files in the cache directory
-        for filename in sorted(os.listdir(cache_dir)):
-            if filename.endswith(".lz4"):
-                filepath = os.path.join(cache_dir, filename)
-                
-                # Decompress the .lz4 file back to .bin
-                bin_file = filepath.replace(".lz4", "")
-                with open(filepath, 'rb') as f_in:
-                    with open(bin_file, 'wb') as f_out:
-                        f_out.write(lz4.frame.decompress(f_in.read()))
-
-                graphs, labels_dict = dgl.load_graphs(bin_file) # returns graph_list: list[DGLGraph], labels: dict[str, Tensor]
-                os.remove(bin_file)
-                labels = labels_dict["labels"].tolist()
-                graphs_labels.extend(zip(graphs, labels)) # Combine graphs and labels into tuples
-
-        return graphs_labels
     
     def infer_label(self, sdf_path):
         """
@@ -351,6 +354,185 @@ class FinetuneDataLoader(Dataset):
     def __len__(self):
         return len(self.graphs_labels)
     
+class FinetuneDataLoader_RG(Dataset):
+    """
+    Load Regression Data.
+    """
+    def  __init__(self, cfg, stage, sdf_path=None):
+        self.cfg = cfg
+        self.stage = stage
+        self.vocab_dict = None
+        if self.cfg.logger.test_run:
+            info("Test run enabled.")
+        if cfg.data.vocablist:
+            # Load vocabulary
+            self.vocab_dict = load_vocabdict(cfg.data.vocablist)
+        else:
+            warning("No vocabulary list provided.")
+            self.vocab_dict = None
+
+        self.sdf_paths = self.split_path(stage)
+        self.csv_path = cfg.train.csv_path
+
+        self.sequences_value = self.load_csv_data() # for look ups.
+
+        self.fasta_dict = self.load_fasta()
+
+        self.graphs_regs_labels = []
+        for sdf_path in self.sdf_paths:
+            self.graphs_regs_labels.extend(self.mol_to_heterograph(sdf_path))
+
+    def mol_to_heterograph(self, sdf_path):
+        """
+        Similar to the method in FinetuneDataLoader
+        """
+        # Make a unique cache directory for each SDF file
+        # so that positive/negative caches don't conflict
+        sdf_basename = os.path.splitext(os.path.basename(sdf_path))[0]
+        cache_dir = os.path.join(self.cfg.data.tmp_dir, f"RG_{self.stage}_{sdf_basename}")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Check if cached graphs are available
+        cache_files = sorted(os.listdir(cache_dir))
+        if cache_files:
+            info(f"Loading cached graphs from {cache_dir}...")
+            return load_graphs(cache_dir)
+        
+        # If no cache exists, process the graphs and save them
+        info(f"No cached graphs found in {cache_dir}. Processing {sdf_path} and caching results...")
+        self.save_cache(sdf_path, self.vocab_dict, cache_dir)
+        return load_graphs(cache_dir)
+    
+    def save_cache(self, sdf_path, vocab_dict, cache_dir, chunk_size=500):
+        """
+        Similar to the method in FinetuneDataLoader
+        """
+        # Read molecules from SDF file
+        # Note that we've switched to SMILES storage.
+        mols = read_SMI_file(sdf_path)
+
+        # Process molecules in chunks
+        chunk_idx = 0
+        graphs_batch = []
+        values_batch = []
+        fasta_seq_batch = []
+
+        if self.cfg.data.chunk_size:
+            chunk_size = self.cfg.data.chunk_size
+
+        # if cfg defined chunk_size, use it, otherwise use the default value
+        for idx, mol in enumerate(tqdm(mols, desc="Processing molecules", unit="mol")):
+            # retrieve fasta seq using mol.GetProp("_Name")
+            fasta_seq = self.fasta_dict.get(mol.GetProp("_Name"), None)
+            # use fasta_seq to look up the sequence in the csv file
+            reg_value = self.sequences_value.get(fasta_seq, None)
+            # Create graph for the molecule based on selected fragmentation method
+            if self.cfg.train.frag_method == "FraSCESS":
+                g = mol2heterograph_frascess(mol, mol.GetProp("_Name"), vocab_dict)
+            elif self.cfg.train.frag_method == "AdaFrag":
+                from .Pepland.data import Mol2HeteroGraph as Pepland_Mol2HG
+                g = Pepland_Mol2HG(mol)
+            elif self.cfg.train.frag_method == "BRICS":
+                g = mol2heterograph_BRICS(mol, mol.GetProp("_Name"), vocab_dict)
+            else:
+                raise ValueError(f"Unknown fragmentation method: {self.cfg.train.frag_method}")
+            
+            if g.number_of_nodes() > 0:
+                if self.mask_graph_fn and self.cfg.train.train_tag == "s1_pretrain":
+                    self.mask_graph_fn(g) # Fixed bugs. shouldn't use g = self.mask_graph_fn(g) for mask_graph_fn(g) returns nothing.
+            else:
+                warning(f"Molecule {mol.GetProp('_Name')} with no nodes.")
+                continue
+
+            graphs_batch.append(g)
+            values_batch.append(reg_value)
+            fasta_seq_batch.append(fasta_seq)
+
+            # If the batch size reaches chunk_size, save it to disk
+            if len(graphs_batch) >= chunk_size:
+                chunk_filename = os.path.join(cache_dir, f"graphs_{self.stage}_chunk_{chunk_idx}.bin")
+                fasta_tensor = torch.tensor(list(pickle.dumps(fasta_seq_batch)), dtype=torch.uint8)
+
+                save_values = {
+                    "values": torch.tensor(values_batch),
+                    "fasta_pickle": fasta_tensor
+                }
+
+                dgl.save_graphs(chunk_filename, graphs_batch, save_values)
+                # Compress the .bin file using LZ4
+                with open(chunk_filename, 'rb') as f_in:
+                    with open(chunk_filename + '.lz4', 'wb') as f_out:
+                        f_out.write(lz4.frame.compress(f_in.read(), compression_level=8))
+                os.remove(chunk_filename)
+                info(f"Saved chunk {chunk_idx} with {len(graphs_batch)} graphs.")
+                chunk_idx += 1
+                graphs_batch = []  # Reset batch for next chunk
+                values_batch = []
+                fasta_seq_batch = []
+
+        # Save any remaining graphs that didn't reach chunk_size
+        if graphs_batch:
+            chunk_filename = os.path.join(cache_dir, f"graphs_{self.stage}_chunk_{chunk_idx}.bin")
+            fasta_tensor = torch.tensor(list(pickle.dumps(fasta_seq_batch)), dtype=torch.uint8)
+
+            save_values = {
+                "values": torch.tensor(values_batch),
+                "fasta_pickle": fasta_tensor
+            }
+
+            dgl.save_graphs(chunk_filename, graphs_batch, save_values)
+            # Compress the .bin file using LZ4
+            with open(chunk_filename, 'rb') as f_in:
+                with open(chunk_filename + '.lz4', 'wb') as f_out:
+                    f_out.write(lz4.frame.compress(f_in.read(), compression_level=8))
+            os.remove(chunk_filename)
+            info(f"Saved final chunk {chunk_idx} with {len(graphs_batch)} graphs.")
+
+    def split_path(self, stage):
+        """
+        Returns a list of SDF file paths for the given stage.
+        The config is expected to define the fields:
+            - train_sdf_pos, train_sdf_neg
+            - valid_sdf_pos, valid_sdf_neg
+            - test_sdf_pos, test_sdf_neg
+        """
+        if stage == "train":
+            return [self.cfg.data.train_sdf_pos, self.cfg.data.train_sdf_neg]
+        elif stage == "valid":
+            return [self.cfg.data.valid_sdf_pos, self.cfg.data.valid_sdf_neg]
+        elif stage == "test":
+            return [self.cfg.data.test_sdf_pos, self.cfg.data.test_sdf_neg]
+        else:
+            raise ValueError(f"Unknown stage: {stage}")
+        
+    def load_csv_data(self):
+        import pandas as pd
+        df = pd.read_csv(self.csv_path)
+        
+        df = df.dropna(subset=["SEQUENCE", "μM"])
+        sequence_reg_dict = dict(zip(df["SEQUENCE"], df["μM"].astype(float)))
+        
+        return sequence_reg_dict
+    
+    def load_fasta(self):
+        """
+        load all fasta in the fasta folder for sequence/title lookup.
+        """
+        # find all fasta files in the fasta folder, get path
+        fasta_files = [os.path.join("fasta_RG", f) for f in os.listdir("fasta_RG") if f.endswith(".fasta")]
+        # read all fasta files into a dict
+        fasta_dict = {}
+        for fasta_file in fasta_files:
+            fasta_dict.update(read_fasta(fasta_file))
+        return fasta_dict
+    
+    def __getitem__(self, idx):
+        graph, reg_value, label = self.graphs_regs_labels[idx]
+        return graph, reg_value, label
+
+    def __len__(self):
+        return len(self.graphs_regs_labels)
+    
 def load_vocabdict(vocabjson_path):
     with open(vocabjson_path, 'r') as f:
         data = json.load(f)
@@ -372,6 +554,40 @@ def collate_fn(batch):
     batched_graph = dgl.batch(list(graphs)) # Combine all the graphs into a single batch
     labels = torch.tensor(list(labels), dtype=torch.float32) # Combine all labels into a tensor
     return batched_graph, labels
+
+def collate_fn_with_seq(batch):
+    graphs, labels, seq_strs = zip(*batch) # Unzip the batch into two lists
+    batched_graph = dgl.batch(list(graphs)) # Combine all the graphs into a single batch
+    labels = torch.tensor(list(labels), dtype=torch.float32) # Combine all labels into a tensor
+
+    encoded_seqs = []
+    for i, g in enumerate(graphs):
+        seq_str = seq_strs[i]
+        tokens = parse_sequence(seq_str)
+        seq_ids = encode_sequence(tokens, TOKEN2ID, max_len=100)
+        encoded_seqs.append(seq_ids)
+        
+    # LongTensor: shape = [batch_size, max_len]
+    encoded_seqs = torch.tensor(encoded_seqs, dtype=torch.long)
+
+    return batched_graph, labels, encoded_seqs
+
+def collate_fn_with_reg(batch):
+    graphs, values, seq_strs = zip(*batch)
+    batched_graph = dgl.batch(list(graphs))
+    values = torch.tensor(list(values), dtype=torch.float32)
+
+    encoded_seqs = []
+    for i, g in enumerate(graphs):
+        seq_str = seq_strs[i]
+        tokens = parse_sequence(seq_str)
+        seq_ids = encode_sequence(tokens, TOKEN2ID, max_len=100)
+        encoded_seqs.append(seq_ids)
+        
+    # LongTensor: shape = [batch_size, max_len]
+    encoded_seqs = torch.tensor(encoded_seqs, dtype=torch.long)
+
+    return batched_graph, values, encoded_seqs
 
 def make_pretrain_loaders(cfg, batch_size):
     # 1) Create datasets for each split
@@ -431,7 +647,7 @@ def make_binary_loaders(cfg, batch_size, mask_graph, inference=False):
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            collate_fn=collate_fn,
+            collate_fn=collate_fn_with_seq,
             num_workers=cfg.data.num_workers,
             pin_memory=True,
             shuffle=True
@@ -439,14 +655,14 @@ def make_binary_loaders(cfg, batch_size, mask_graph, inference=False):
         valid_loader = DataLoader(
             valid_dataset,
             batch_size=batch_size,
-            collate_fn=collate_fn,
+            collate_fn=collate_fn_with_seq,
             num_workers=cfg.data.num_workers,
             pin_memory=True
         )
         test_loader = DataLoader(
             test_dataset,
             batch_size=batch_size,
-            collate_fn=collate_fn,
+            collate_fn=collate_fn_with_seq,
             num_workers=cfg.data.num_workers,
             pin_memory=True
         )
@@ -465,7 +681,7 @@ def make_binary_loaders(cfg, batch_size, mask_graph, inference=False):
         test_loader = DataLoader(
             test_dataset,
             batch_size=batch_size,
-            collate_fn=collate_fn,
+            collate_fn=collate_fn_with_seq,
             num_workers=cfg.data.num_workers,
             pin_memory=True
         )
@@ -476,8 +692,97 @@ def make_binary_loaders(cfg, batch_size, mask_graph, inference=False):
         
     return dataloaders, train_dataset.vocab_dict
 
-def make_regression_loaders(cfg, batch_size):
-    pass
+def make_regression_loaders(cfg, batch_size, inference=False):
+    if not inference:
+        # 1) Create datasets for each split
+        train_dataset = FinetuneDataLoader_RG(cfg, "train")
+        
+        if cfg.logger.test_run:
+            valid_dataset = train_dataset
+            test_dataset = train_dataset
+        else:
+            valid_dataset = FinetuneDataLoader_RG(cfg, "valid")
+            test_dataset  = FinetuneDataLoader_RG(cfg, "test")
+
+        # 2) Wrap them in PyTorch DataLoaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            collate_fn=collate_fn_with_reg,
+            num_workers=cfg.data.num_workers,
+            pin_memory=True,
+            shuffle=True
+        )
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_size=batch_size,
+            collate_fn=collate_fn_with_reg,
+            num_workers=cfg.data.num_workers,
+            pin_memory=True
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            collate_fn=collate_fn_with_reg,
+            num_workers=cfg.data.num_workers,
+            pin_memory=True
+        )
+
+        # 3) Return the loaders plus the vocabulary from one of them (or a consistent place)
+        dataloaders = {
+            "train": train_loader,
+            "valid": valid_loader,
+            "test": test_loader
+        }
+
+    else:
+        info("Inference mode. Loading test dataset only.")
+        test_dataset = FinetuneDataLoader_RG(cfg, "test")
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            collate_fn=collate_fn_with_reg,
+            num_workers=cfg.data.num_workers,
+            pin_memory=True
+        )
+
+        dataloaders = {
+            "test": test_loader
+        }
+        
+    return dataloaders, train_dataset.vocab_dict
+
+def load_graphs(cache_dir):
+    """
+    Load all graph chunks from the cache directory.
+
+    Args:
+    - cache_dir (str): Directory containing the saved graph chunks.
+
+    Returns:
+    - List of (graph, label) tuples
+    """
+    graphs_labels = []
+
+    # Iterate through all chunk files in the cache directory
+    for filename in sorted(os.listdir(cache_dir)):
+        if filename.endswith(".lz4"):
+            filepath = os.path.join(cache_dir, filename)
+            
+            # Decompress the .lz4 file back to .bin
+            bin_file = filepath.replace(".lz4", "")
+            with open(filepath, 'rb') as f_in:
+                with open(bin_file, 'wb') as f_out:
+                    f_out.write(lz4.frame.decompress(f_in.read()))
+
+            graphs, labels_dict = dgl.load_graphs(bin_file) # returns graph_list: list[DGLGraph], labels: dict[str, Tensor]
+            os.remove(bin_file)
+            labels = labels_dict["labels"].tolist()
+            fasta_seq_loaded = pickle.loads(bytes(labels_dict["fasta_pickle"].tolist()))
+            graphs_labels.extend(zip(graphs, labels, fasta_seq_loaded)) # Combine graphs and labels into tuples
+
+    return graphs_labels
 
 def read_SMI_file(file_path: str) -> list[Chem.Mol]:
     """
@@ -487,12 +792,12 @@ def read_SMI_file(file_path: str) -> list[Chem.Mol]:
     :return: List of RDKit Mol objects with bond properties restored
     """
     if not os.path.exists(file_path):
-        raise ValueError("File path does not exist.")
+        raise ValueError(f"File path does not exist. {file_path}")
     
     suppl = Chem.SmilesMolSupplier(file_path, titleLine=True, delimiter = '!^!') 
     mols = []
     
-    for mol in suppl:
+    for mol in suppl: 
         if mol is None:
             continue
         if mol.HasProp("_BondProps"):
@@ -554,3 +859,24 @@ def read_SDF_file(file_path: str) -> list[Chem.Mol]:
     info(f"Read {len(mols)} molecules from {file_path}")
     
     return mols
+
+def read_fasta(fastapath):
+    """
+    Read fasta file and return a list of sequences with titles.
+    """
+    sequences = []
+    with open(fastapath, 'r', encoding="utf-8") as f:
+        title = None
+        seq = []
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                if title:
+                    sequences.append((title, ''.join(seq)))
+                title = line[1:]
+                seq = []
+            else:
+                seq.append(line)
+        if title:
+            sequences.append((title, ''.join(seq)))
+    return sequences

@@ -10,6 +10,7 @@ import math
 from model.utils import get_func
 from utils.std_logger import info
 from .readouts import GlobalPooling, HierAttnReadout
+from model.sequence_embedding import LSTMEncoder, VOCAB_SIZE
 
 # dgl graph utils
 def reverse_edge(tensor):
@@ -365,8 +366,22 @@ class PharmHGT_FP(nn.Module):
         # if readout, remove the pooling layer
         if self.readout:
             self.pooling = None
+
+        self.LSTM_seq = LSTMEncoder(
+            vocab_size=VOCAB_SIZE,
+            embed_dim=150,
+            hidden_dim=150,
+            num_layers=2
+        )
+
+        if self.cfg.train.readout == 'gru':
+            self.graph_proj = nn.Linear(hid_dim*2, 300)  # 600 -> 300
+        else:
+            self.graph_proj = nn.Linear(hid_dim, 300) # 300 -> 300
+
+        self.gated_fusion = GatedFusion(embed_dim=300)
         
-        self.mlp = MLP(hid_dim, num_classes=cfg.train.num_tasks, readout=self.readout)
+        self.mlp = MLP(hid_dim=hid_dim, num_classes=cfg.train.num_tasks, input_dim=hid_dim)
 
         self.initialize_weights()
 
@@ -440,43 +455,57 @@ class PharmHGT_FP(nn.Module):
 
         return model
     
-    def forward(self, bg):
+    def forward(self, bg, encoded_seqs):
         # embedding extraction
         if self.load_pretrained:
             # do not mess up the pretrained model
             with torch.no_grad():
                 bg = self.pretrain_model(bg, finetune=True)
-                # embed_f_a = bg.nodes['a'].data['f_h'] torch.Size([26623, 300])
-                # embed_f_p = bg.nodes['p'].data['f_h'] torch.Size([6775, 300])
+                # embed_f_a = bg.nodes['a'].data['f_h'] torch.Size([26623, 300]) # [B * La, D]
+                # embed_f_p = bg.nodes['p'].data['f_h'] torch.Size([6775, 300]) # [B * Lp, D]
         else:
             bg = self.pretrain_model(bg, finetune=True)
 
-        # if readout
-        if self.readout:
-            bg = self.readout(bg)
+        # sequence embedding
+        seq_features = self.LSTM_seq(encoded_seqs)
+        # seq_features: [batch_size, hidden_dim*2]
 
-        # pooling
-        if self.pooling:
-            bg_embeds = self.pooling(bg)  # => shape [B, hid_dim]
+        # if readout, or pooling
+        if self.readout:
+            bg_embeds = self.readout(bg)   # if GRUReadout, (batch_size, hid_dim*2)
         else:
-            bg_embeds = bg # bg by att readout is a graph_embed
+            bg_embeds = self.pooling(bg)   # (batch_size, hid_dim)
+
+        bg_embeds = self.graph_proj(bg_embeds)
+
+        fused_feats = self.gated_fusion(bg_embeds, seq_features)  # (batch_size, hid_dim)
 
         # mlp
-        logits = self.mlp(bg_embeds)  # => shape [B, num_classes]
+        logits = self.mlp(fused_feats)  # => shape [B, num_classes]
 
         return logits # shape [B, 1] for binary classification
     
+class GatedFusion(nn.Module):
+    def __init__(self, embed_dim):
+        super(GatedFusion, self).__init__()
+        self.gate_fc = nn.Linear(embed_dim * 2, embed_dim)
+
+    def forward(self, feat1, feat2):
+        """
+        feat1, feat2: (batch_size, D)
+        """
+        # concat and gate
+        cat_feat = torch.cat([feat1, feat2], dim=-1)  # (B, 2D)
+        gate = torch.sigmoid(self.gate_fc(cat_feat))  # (B, D)
+        out = gate * feat1 + (1.0 - gate) * feat2
+        return out
+    
 class MLP(nn.Module):
     """feed bg_embeds to MLP and give binary classification, note that num_classes=1"""
-    def __init__(self, hid_dim, num_classes, readout):
+    def __init__(self, hid_dim, num_classes, input_dim):
         super(MLP,self).__init__()
-        if readout == 'gru':  # bidirectional
-            input_dim = 2 * hid_dim
-        else:
-            input_dim = hid_dim
-            
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hid_dim),  # [600 → 300]
+            nn.Linear(input_dim, hid_dim),
             nn.ReLU(),
             nn.Linear(hid_dim, hid_dim // 2),
             nn.ReLU(),
@@ -599,10 +628,50 @@ class GRUReadout(nn.Module):
         graph_embed = torch.cat(graph_embed, dim=0)  # [B, hid_dim * num_directions]
         return graph_embed
     
-class AmpHGT_FT(nn.Module):
+class AmpHGT_FT(PharmHGT_FP):
     """
     AmpHGT (PharmHGT_pretrained + pooling/readout) trained. FT: From Trained.
+    Inference-optimized version with inheritance
+
+    1. Force load_pretrained=False (since weights are in state_dict)
+    2. Add inference-specific forward
+    3. Provide loading interface
     """
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        pass
+        super().__init__(
+            *args, 
+            load_pretrained=False,
+            **kwargs
+        )
+
+    def forward(self, bg, encoded_seqs):
+        """ Inference-optimized forward """
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            # call the parent forward
+            logits = super().forward(bg, encoded_seqs)
+            return logits
+        
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path, cfg, device, **kwargs):
+        model = cls(
+            cfg=cfg,
+            hid_dim=cfg.train.hid_dim,
+            act=cfg.train.act,
+            depth=cfg.train.depth,
+            atom_dim=cfg.train.atom_dim,
+            bond_dim=cfg.train.bond_dim,
+            pharm_dim=cfg.train.pharm_dim,
+            reac_dim=cfg.train.reac_dim,
+            device=device,
+            **kwargs
+        )
+
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        state_dict = {
+            k.replace('module.', ''): v  # if DDP, remove the 'module.' prefix
+            for k, v in checkpoint['model_state_dict'].items()
+        }
+        model.load_state_dict(state_dict, strict=True)
+        model.eval()
+        return model

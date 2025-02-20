@@ -1,8 +1,9 @@
+from matplotlib import pyplot as plt
 from torch import nn
 import numpy as np
 import torch
 from sklearn.metrics import auc, f1_score, matthews_corrcoef, mean_absolute_error, mean_squared_error, precision_recall_curve, precision_score, r2_score, recall_score,\
-    roc_auc_score, accuracy_score, log_loss
+    roc_auc_score, accuracy_score, log_loss, confusion_matrix, roc_curve
 
 def compute_accuracy(pred, target):
     return float(torch.sum(torch.max(pred.detach(), dim = 1)[1] == target).cpu().item())/len(pred)
@@ -25,6 +26,37 @@ def compute_need_metrics(pred, target):
     mcc = matthews_corrcoef(target_labels, pred_labels)
 
     return accuracy, precision, sensitivity, specificity, f1, mcc
+
+def compute_confusion_matrix(all_preds, all_trues, threshold=0.5):
+    all_preds = (all_preds >= threshold).int()
+    all_trues = all_trues.int()
+
+    cm = confusion_matrix(all_trues, all_preds)
+
+    return cm
+
+def plot_roc_curve(all_preds, all_trues):
+    # 将预测的概率值和真实标签转换为 numpy 数组
+    all_preds = all_preds.numpy()
+    all_trues = all_trues.numpy()
+
+    # 计算 FPR 和 TPR
+    fpr, tpr, _ = roc_curve(all_trues, all_preds)
+    roc_auc = auc(fpr, tpr)
+
+    # 绘制 ROC 曲线
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label='ROC curve (area = %0.2f)' % roc_auc)
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curve')
+    plt.legend(loc="lower right")
+    plt.savefig('roc_curve.png', dpi=300)
+
+    return roc_auc
 
 def remove_nan_label(pred,truth):
     nan = torch.isnan(truth)

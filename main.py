@@ -19,13 +19,14 @@ import argparse
 
 from model.PepMAE import PepMAE
 from utils.read_params import lcfig, Cfig
-from utils.data_rework import make_pretrain_loaders, make_binary_loaders
+from utils.data_rework import make_pretrain_loaders, make_binary_loaders, make_regression_loaders
 from utils.MaskMethod import MaskGraph
 from utils.std_logger import initialize_logger, info
 from utils.seed_device import setup_seed_reproducibility
 
 from trainers.pretrain_trainer import Masking_Trainer
 from trainers.finetune_trainer import Finetune_Trainer
+from trainers.inferencer import Inferencer_Binary
 
 from model.PharmHGT_refactor import PharmHGT, PharmHGT_FP, AmpHGT_FT
 # from model.pretrain_heads import PretrainingHeads, PretrainingMetrics, ReconstructionLoss
@@ -258,7 +259,74 @@ def finetune_binary_main(cfg: Cfig):
 
 @lcfig(config_path = 'configs/finetune_regression.yaml', output_dir = "out_finetune_regression")
 def finetune_regression_main(cfg: Cfig):
-    pass
+    """
+    Main function to fine-tune the model with regression targets. testing amphgt with hemolytic/inhibitory concentration dataset.
+    """
+    ensure_dir_exists(cfg.logger.log_dir)
+
+    initialize_logger(cfg.logger.log_dir)
+
+    # copy the config file to the log directory
+    shutil.copy('configs/finetune_regression.yaml', os.path.join(cfg.logger.log_dir, "finetune_regression.yaml"))
+
+    # Initialize the random seed and device configuration for reproducibility
+    devices = setup_seed_reproducibility(cfg.train.seed, cfg.train.cuda_deterministic)
+
+    # Set up MLflow tracking if enabled
+    if cfg.logger.log:
+        info("Setting up MLflow tracking...")
+        mlflow.set_tracking_uri(cfg.logger.tracking_uri)
+        mlflow.set_experiment(cfg.logger.mlflow_exp_name)
+
+    devices = devices[0]
+
+    info("Creating DataLoaders...")
+    finetune_loader, vocab_dict = make_regression_loaders(
+        cfg,
+        batch_size=cfg.train.batch_size,
+    )
+
+    info("Setting up model...")
+    model = PharmHGT_FP(
+        cfg,
+        cfg.train.hid_dim, 
+        cfg.train.act, 
+        cfg.train.num_layer,
+        cfg.train.atom_dim, 
+        cfg.train.bond_dim,
+        cfg.train.pharm_dim, 
+        cfg.train.reac_dim,
+        devices,
+        cfg.train.load_pretrained
+    ).to(devices)
+
+    info("Setting up optimizers...")
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=cfg.train.lr,
+        weight_decay=cfg.train.decay
+    )
+
+    with mlflow.start_run():
+        info("Logging hyper-parameters...")
+        # log hyper-parameters
+        for p, v in cfg.train.items():
+            mlflow.log_param(p, v)
+
+        info("Initializing trainer...")
+        trainer = Finetune_Trainer(
+            cfg=cfg,
+            dataloaders=finetune_loader, # this is a dict with "train"/"valid"/"test"
+            model=model,
+            optimizer=optimizer,
+            device=devices,
+            outputdir=cfg.logger.log_dir
+        )
+        
+        info("Starting training...")
+        trainer.run()
+
+    info("finished training......")
 
 @lcfig(config_path = 'configs/inference_binary.yaml', output_dir = "out_inference_binary")
 def inference_binary_main(cfg: Cfig):
@@ -298,6 +366,26 @@ def inference_binary_main(cfg: Cfig):
             ),
         inference=True
     ) # inference loader only load test path data.
+
+    info("Setting up model...")
+    model = AmpHGT_FT.from_checkpoint(
+        checkpoint_path=cfg.train.checkpoint_path,
+        cfg=cfg,
+        device=devices
+    )
+
+    inferencer = Inferencer_Binary(
+        cfg=cfg,
+        dataloaders=inference_loader, # this is a dict with "test" only.
+        model=model,
+        device=devices
+    )
+
+    info("Starting inference...")
+
+    inferencer.infer()
+
+    info("finished inference......")
 
 @lcfig(config_path = 'configs/extract_embeddings_encoder.yaml', output_dir = "out_extract_encoder_embeddings")
 def extract_embeddings_encoder_main(cfg: Cfig):

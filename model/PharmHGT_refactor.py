@@ -605,8 +605,9 @@ class GRUReadout(nn.Module):
         
         # 4) process with GRU (B, La, D)
         # initialize hidden: [num_directions, B, hid_dim]
-        hidden_0 = a_updated.mean(dim=1, keepdim=True)  # shape (B,1,D)
-        hidden_0 = hidden_0.repeat(self.num_directions, 1, 1)  # [num_directions, B, D]
+        hidden_0 = a_updated.mean(dim=1)  # (B,D)
+        hidden_0 = hidden_0.unsqueeze(0)  # (1,B,D)
+        hidden_0 = hidden_0.repeat(self.num_directions, 1, 1)  # (2,B,D)
         
         # run GRU
         # a_out: [B, La, hid_dim * num_directions]

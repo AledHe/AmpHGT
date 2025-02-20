@@ -524,7 +524,7 @@ class GRUReadout(nn.Module):
     - Then use GRU to process the sequence and aggregate to get graph-level embedding.
     """
     def __init__(self, hid_dim, bidirectional=True):
-        super(Node_GRU, self).__init__()
+        super(GRUReadout, self).__init__()
         self.hid_dim = hid_dim
         self.bidirectional = bidirectional
         self.num_directions = 2 if bidirectional else 1

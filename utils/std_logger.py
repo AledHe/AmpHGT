@@ -64,6 +64,7 @@ def critical(msg, *args, st=0, **kwargs):
     if st > 0:
         time.sleep(st)
     logger.critical(msg, *args, stacklevel=2, **kwargs)
+    raise Exception(msg)
 
 def set_log_level(level):
     """

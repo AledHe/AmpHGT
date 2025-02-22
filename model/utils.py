@@ -35,7 +35,7 @@ def compute_confusion_matrix(all_preds, all_trues, threshold=0.5):
 
     return cm
 
-def plot_roc_curve(all_preds, all_trues):
+def plot_roc_curve(all_preds, all_trues, save_path):
     # 将预测的概率值和真实标签转换为 numpy 数组
     all_preds = all_preds.numpy()
     all_trues = all_trues.numpy()
@@ -54,7 +54,7 @@ def plot_roc_curve(all_preds, all_trues):
     plt.ylabel('True Positive Rate')
     plt.title('Receiver Operating Characteristic (ROC) Curve')
     plt.legend(loc="lower right")
-    plt.savefig('roc_curve.png', dpi=300)
+    plt.savefig(f'{save_path}/roc_curve.png', dpi=300)
 
     return roc_auc
 

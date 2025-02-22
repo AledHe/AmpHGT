@@ -83,7 +83,7 @@ class Node_GRU(nn.Module):
             self.direction = 2
         else:
             self.direction = 1
-        self.att_mix = MultiHeadedAttention(6,hid_dim)
+        self.att_mix = MultiHeadedAttention(4,hid_dim)
         self.gru  = nn.GRU(hid_dim, hid_dim, batch_first=True, 
                            bidirectional=bidirectional)
     
@@ -146,7 +146,7 @@ def copy_src(edges, src_field, out_field):
 
  
 class MVMP(nn.Module):
-    def __init__(self,msg_func=add_attn,hid_dim=300,depth=3,view='aba',suffix='h',act=nn.ReLU()):
+    def __init__(self,msg_func=add_attn,hid_dim=768,depth=9,view='aba',suffix='h',act=nn.ReLU()):
         """
         MultiViewMassagePassing
         view: a, ap, apj
@@ -183,10 +183,39 @@ class MVMP(nn.Module):
     def update_edge(self,edge,layer):
         return {'h':self.act(edge.data['x']+layer(edge.data['m']))}
     
-    def update_node(self,node,field,layer):
+    def _update_node(self,node,field,layer):
         return {field:layer(torch.cat([node.mailbox['mail'].sum(dim=1),
                                        node.data[field],
                                        node.data['f']],1))}
+    
+    def update_node(self, node, field, layer):
+        """
+        node : a DGL NodeBatch
+        field: string of the node-data field we are updating (e.g. 'f_h')
+        layer: a linear (or MLP) layer that maps from concat dimension -> hid_dim
+        """
+        # grab the *old* node feature that we want to skip from
+        old_feat = node.data[field]
+
+        # sum mailbox messages
+        msg_sum = node.mailbox['mail'].sum(dim=1)
+
+        concat_input = torch.cat([
+            msg_sum,          # aggregated messages from neighbors
+            old_feat,         # previous layer embedding
+            node.data['f']    # raw or initial embedding (optional if desired)
+        ], dim=1)
+
+        new_feat = layer(concat_input)
+
+        # add the residual connection
+        out_feat = new_feat + old_feat
+
+        # apply nonlinearity
+        out_feat = self.act(out_feat)  # or a LayerNorm etc.
+
+        return { field: out_feat }
+    
     def init_node(self,node):
         return {f'f_{self.suffix}':node.data['f'].clone()}
 
@@ -647,7 +676,7 @@ class AmpHGT_FT(PharmHGT_FP):
 
     def forward(self, bg, encoded_seqs):
         """ Inference-optimized forward """
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad():
             # call the parent forward
             logits = super().forward(bg, encoded_seqs)
             return logits
@@ -674,5 +703,6 @@ class AmpHGT_FT(PharmHGT_FP):
             for k, v in checkpoint['model_state_dict'].items()
         }
         model.load_state_dict(state_dict, strict=True)
+        info(f"loaded model from {checkpoint_path}, with {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters.") 
         model.eval()
         return model

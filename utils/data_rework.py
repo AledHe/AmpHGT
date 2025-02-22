@@ -179,7 +179,7 @@ class FinetuneDataLoader(Dataset):
         load all fasta in the fasta folder for sequence/title lookup.
         """
         # find all fasta files in the fasta folder, get path
-        fasta_files = [os.path.join("fasta", f) for f in os.listdir("fasta") if f.endswith(".fasta")]
+        fasta_files = [os.path.join(self.cfg.data.fasta_dir, f) for f in os.listdir(self.cfg.data.fasta_dir) if f.endswith(".fasta")]
         # read all fasta files into a dict
         fasta_dict = {}
         for fasta_file in fasta_files:
@@ -690,7 +690,7 @@ def make_binary_loaders(cfg, batch_size, mask_graph, inference=False):
             "test": test_loader
         }
         
-    return dataloaders, train_dataset.vocab_dict
+    return dataloaders, train_dataset.vocab_dict if not inference else test_dataset.vocab_dict
 
 def make_regression_loaders(cfg, batch_size, inference=False):
     if not inference:

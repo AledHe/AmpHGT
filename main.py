@@ -114,14 +114,6 @@ def pretrain_main(cfg: Cfig):
     pretrain_loader, vocab_dict = make_pretrain_loaders(
         cfg, 
         batch_size=cfg.train.batch_size,
-        # mask_graph=MaskGraph(
-        #     num_atom_type=119,
-        #     num_edge_type=5,
-        #     mask_edge=cfg.train.mask_edge,
-        #     mask_atom=cfg.train.mask_atom,
-        #     mask_fragment=cfg.train.mask_fragment,
-        #     mask_rate=cfg.train.mask_rate,
-        #     )
         )
 
     info("Setting up model...")
@@ -132,7 +124,8 @@ def pretrain_main(cfg: Cfig):
         cfg.train.atom_dim, 
         cfg.train.bond_dim,
         cfg.train.pharm_dim, 
-        cfg.train.reac_dim
+        cfg.train.reac_dim,
+        devices
     ).to(devices)
 
     ### New head added 24.10.24
@@ -211,6 +204,7 @@ def finetune_binary_main(cfg: Cfig):
             mask_edge=cfg.train.mask_edge,
             mask_atom=cfg.train.mask_atom,
             mask_fragment=cfg.train.mask_fragment,
+            mask_rsd=cfg.train.mask_rsd,
             mask_rate=cfg.train.mask_rate,
             )
         )

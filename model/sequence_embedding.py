@@ -1,13 +1,14 @@
 """
-Simple BiLSTM to incorporate sequence information.
+Simple Cov+Transformer to incorporate sequence information.
 """
 
+import dgl
 import torch
 import torch.nn as nn
 
 def read_vocab(vocab_file: str) -> list:
-    # append "<PAD>", "<UNK>", to the beginning of the vocab
-    vocab = ["<PAD>", "<UNK>"]
+    # prepend "<PAD>", "<UNK>", "<CLS>" and "<MASK>" to the vocab
+    vocab = ["<PAD>", "<UNK>", "<CLS>", "<MASK>"]
     with open(vocab_file, 'r', encoding="utf-8") as f:
         for line in f:
             vocab.append(line.strip())
@@ -18,72 +19,262 @@ def read_vocab(vocab_file: str) -> list:
 
 VOCAB, TOKEN2ID, VOCAB_SIZE = read_vocab("model/vocab.txt")
 
-def parse_sequence(seq: str):
-    tokens = []
-    i = 0
-    while i < len(seq):
-        if seq[i] == '<':
-            j = i
-            while j < len(seq) and seq[j] != '>':
-                j += 1
-            tokens.append(seq[i:j+1])  # '<D-Allo-ILE>'
-            i = j + 1
-        else:
-            # for single character, directly append to tokens
-            tokens.append(seq[i])
-            i += 1
-    
-    tokens = [t.strip() for t in tokens if t.strip() != '']
-    return tokens
-
-def encode_sequence(tokens, token2id, max_len=100):
-    """
-    map tokens to ids and pad to max_len
-    """
-    unk_idx = token2id.get("<UNK>", 1)
-    pad_idx = token2id.get("<PAD>", 0)
-
-    ids = [token2id.get(t, unk_idx) for t in tokens]
-
-    if len(ids) < max_len:
-        ids += [pad_idx] * (max_len - len(ids))
-    else:
-        ids = ids[:max_len]
-    return ids
-    
-class LSTMEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim=150, hidden_dim=150, num_layers=2):
+class PositionEmbedding(nn.Module):
+    def __init__(self, max_len, embed_dim):
         super().__init__()
-        self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embed_dim)
-        self.lstm = nn.LSTM(input_size=embed_dim,
-                            hidden_size=hidden_dim,
-                            num_layers=num_layers,
-                            batch_first=True,
-                            bidirectional=True,
-                            dropout=0.1)
+        self.pos_embedding = nn.Embedding(max_len, embed_dim)
+
+    def forward(self, x, seq_len):
+        """
+        x: [batch_size, seq_len, embed_dim]
+        seq_len: integer
+        """
+        positions = torch.arange(seq_len, device=x.device).unsqueeze(0) # [1, seq_len]
+        pos_emb = self.pos_embedding(positions)  # [1, seq_len, embed_dim]
+        return x + pos_emb # [batch_size, seq_len, embed_dim]
     
-    def forward(self, input_ids):
+class ConvTransformerEncoder(nn.Module):
+    """
+    1D Conv + Transformer Encoder adapted for graph node features
+    """
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        conv_channels: int = 512,
+        kernel_size: int = 5,
+        num_heads: int = 4,
+        num_layers: int = 2,
+        ff_dim: int = 1024,
+        dropout: float = 0.1,
+        ):
         """
-        input_ids: [batch_size, seq_len]
-        return:
-            outputs: [batch_size, seq_len, hidden_dim * 2]
-            (h, c): LSTM's hidden state and cell state
+        args:
+        - embed_dim: word vector dimension
+        - conv_channels: number of convolution output channels
+        - kernel_size: convolution kernel size
+        - num_heads: number of Transformer multi-head attention
+        - num_layers: number of TransformerEncoderLayer layers
+        - ff_dim: hidden layer dimension of FeedForward network in Transformer
+        - dropout: Dropout probability
         """
-        # get embedding from vocab
-        x = self.embedding(input_ids)  # [batch_size, seq_len, embed_dim]
-        outputs, (h, c) = self.lstm(x) 
-        # outputs: [batch_size, seq_len, hidden_dim * 2]
-        # h: [num_layers*2, batch_size, hidden_dim]
-        # c: [num_layers*2, batch_size, hidden_dim]
+        super().__init__()
+        
+        # 1D Convolution
+        self.conv1d = nn.Conv1d(
+            in_channels=embed_dim,
+            out_channels=conv_channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2
+        )
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=conv_channels,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+        self.dropout = nn.Dropout(dropout)
 
-        # split the hidden state and cell state
-        # [num_layers, 2, batch_size, hidden_dim]
-        h = h.view(self.lstm.num_layers, 2, -1, self.lstm.hidden_size)
-        c = c.view(self.lstm.num_layers, 2, -1, self.lstm.hidden_size)
+    def forward(self, x, mask=None):
+        """
+        x: [batch_size, seq_len, embed_dim]
+        mask: [batch_size, seq_len, seq_len], 1 -> include, 0 -> exclude
+        """
+        # Dropout
+        x = self.dropout(x) # [batch_size, seq_len, embed_dim]
 
-        last_h_forward = h[-1, 0, :, :] # the last layer, forward direction, [batch_size, hidden_dim]
-        last_h_backward = h[-1, 1, :, :] # the last layer, backward direction, [batch_size, hidden_dim]
+        # Convolution over embedding dimension
+        x = x.transpose(1, 2)  # [batch_size, embed_dim, seq_len]
+        x = self.conv1d(x)     # [batch_size, conv_channels, seq_len]
+        x = x.transpose(1, 2)  # [batch_size, seq_len, conv_channels]
 
-        fused_h = torch.cat([last_h_forward, last_h_backward], dim=-1)  # [batch_size, hidden_dim*2]
+        # Construct key-padding mask if needed
+        if mask is not None:
+            # for nn.Transformer, src_key_padding_mask is [batch_size, seq_len],
+            # so we can extract it from diagonal or row sums, etc.
+            key_padding_mask = (mask.sum(dim=-1) == 0) # [batch_size, seq_len]
+        else:
+            key_padding_mask = None
 
-        return fused_h
+        out = self.transformer_encoder(x, src_key_padding_mask=key_padding_mask) # [batch_size, seq_len, conv_channels]
+        return out
+    
+class ResidueEncoder(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        embed_dim=256,
+        max_len=100,
+        token2id=None,
+        conv_channels=512,
+        kernel_size=5,
+        num_heads=4,
+        num_layers=2,
+        ff_dim=1024,
+        dropout=0.1
+        ):
+        super().__init__()
+        if token2id:
+            self.token2id = token2id
+        else:
+            self.token2id = TOKEN2ID
+        self.embedding = nn.Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=embed_dim,
+            padding_idx=0  # or token2id["<PAD>"]
+        )
+        self.pos_emb = PositionEmbedding(max_len, embed_dim)
+        self.encoder = ConvTransformerEncoder(
+            embed_dim=embed_dim,
+            conv_channels=conv_channels,
+            kernel_size=kernel_size,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            ff_dim=ff_dim,
+            dropout=dropout
+        )
+    
+    def _prepare_residue_batch(self, bg):
+        # unbatch
+        graphs = dgl.unbatch(bg)
+        batch_size = len(graphs)
+
+        # gather all subgraphs
+        all_sorted_labels = []
+        all_inverse_indices = []
+        max_len = 0
+
+        for g in graphs:
+            if g.num_nodes('rsd') == 0:
+                # store empty placeholders
+                all_sorted_labels.append(torch.tensor([], device=g.device, dtype=torch.long)) # [0]
+                all_inverse_indices.append(torch.tensor([], device=g.device, dtype=torch.long)) # [0]
+                continue
+
+            # sort by 'pos'
+            sorted_pos, sorted_idx = torch.sort(g.nodes['rsd'].data['pos']) # [num_nodes]
+            original_labels = g.nodes['rsd'].data['label'][sorted_idx] # [num_nodes]
+
+            # insert <CLS>
+            if self.token2id is not None:
+                cls_token_id = self.token2id['<CLS>']
+            else:
+                cls_token_id = 2  # some default
+
+            cls_token = torch.tensor([cls_token_id], device=original_labels.device) # [1]
+            sorted_labels = torch.cat([cls_token, original_labels]) # [1 + num_nodes]
+
+            # generate inverse index so we can restore the original order
+            _, inverse_idx = torch.sort(sorted_idx) # [num_nodes]
+
+            all_sorted_labels.append(sorted_labels)
+            all_inverse_indices.append(inverse_idx)
+            max_len = max(max_len, len(sorted_labels))
+
+        # prepare padded labels & attention mask
+        padded_labels = torch.full(
+            (batch_size, max_len),
+            fill_value=self.token2id['<PAD>'] if self.token2id else 0,
+            device=bg.device,
+            dtype=torch.long
+        ) # [batch_size, max_len]
+        attention_mask = torch.zeros(
+            (batch_size, max_len, max_len),
+            device=bg.device,
+            dtype=torch.float
+        ) # [batch_size, max_len, max_len]
+
+        # fill each row
+        for i, sorted_labels in enumerate(all_sorted_labels):
+            seq_len = sorted_labels.shape[0]
+            if seq_len == 0:
+                continue
+            padded_labels[i, :seq_len] = sorted_labels
+            attention_mask[i, :seq_len, :seq_len] = 1.0
+
+        return padded_labels, attention_mask, all_inverse_indices, max_len, graphs
+
+    def forward(self, bg):
+        # prepare batched residues
+        padded_labels, attention_mask, all_inverse_indices, max_len, graphs = \
+            self._prepare_residue_batch(bg)
+        
+        # padded_labels Shape: [batch_size, max_len]
+        # attention_mask Shape: [batch_size, max_len, max_len]
+
+        # embedding + positional
+        x = self.embedding(padded_labels)          # [batch_size, max_len, embed_dim]
+        x = self.pos_emb(x, seq_len=max_len)       # add position embedding
+
+        # conv + Transformer
+        encoded = self.encoder(x, mask=attention_mask)  # [batch_size, max_len, conv_channels]
+
+        # recover node-wise features and gather CLS vectors
+        rsd_features = []
+        cls_features = []
+        idx = 0
+
+        for i, g in enumerate(graphs):
+            seq_len = len(all_inverse_indices[i]) + 1  # +1 for CLS
+            if seq_len <= 1:
+                # no real residue nodes
+                continue
+
+            sub_enc = encoded[i, :seq_len]  # [seq_len, conv_channels]
+            cls_feat = sub_enc[0] # [conv_channels]
+            node_feat = sub_enc[1:] # [seq_len-1, conv_channels]
+            # reorder node_feat to the original index
+            node_feat = node_feat[all_inverse_indices[i]] # [num_nodes, conv_channels]
+            rsd_features.append(node_feat)
+            cls_features.append(cls_feat)
+
+        # concatenate final node features, stack CLS 
+        if len(rsd_features) > 0:
+            rsd_features = torch.cat(rsd_features, dim=0) # [total_num_nodes, conv_channels]
+            cls_features = torch.stack(cls_features, dim=0) # [num_valid_graphs, conv_channels]
+        else:
+            rsd_features = torch.zeros((0, encoded.shape[-1]), device=encoded.device)
+            cls_features = torch.zeros((0, encoded.shape[-1]), device=encoded.device)
+
+        return rsd_features, cls_features # [total_num_nodes, conv_channels], [num_valid_graphs, conv_channels]
+
+if __name__ == "__main__":
+    # Test the ResidueEncoder
+    g = dgl.heterograph({
+        ('rsd', 's', 'rsd'): ([], [])
+    }, num_nodes_dict={'rsd': 2})
+
+    # 添加节点特征
+    g.nodes['rsd'].data['label'] = torch.tensor([TOKEN2ID['A'], TOKEN2ID['<ORN>']])
+    g.nodes['rsd'].data['pos'] = torch.tensor([0, 1])
+
+    print(g)
+
+    # 创建一个包含单个子图的批处理图
+    bg = dgl.batch([g])
+
+    # 使用ResidueEncoder处理
+    residue_encoder = ResidueEncoder(vocab_size=VOCAB_SIZE, embed_dim=256)
+    output = residue_encoder(bg)
+
+    print(output.shape)  # [2, conv_channels] for there is two residue, Ala, Orn in the graph
+
+    # 测试样例：创建一个包含两个分子的批次图
+    g1 = dgl.heterograph({('rsd','s','rsd'): [(0,1), (1,0)]}, num_nodes_dict={'rsd':2})
+    g1.nodes['rsd'].data['label'] = torch.LongTensor([1,2])
+    g1.nodes['rsd'].data['pos'] = torch.LongTensor([1,2])
+
+    g2 = dgl.heterograph({('rsd','s','rsd'): [(0,1), (1,0)]}, num_nodes_dict={'rsd':2})
+    g2.nodes['rsd'].data['label'] = torch.LongTensor([3,4])
+    g2.nodes['rsd'].data['pos'] = torch.LongTensor([1,2])
+
+    bg = dgl.batch([g1, g2])
+    rsd_emb = ResidueEncoder()(bg)
+    print(bg.nodes['rsd'].data['label'])  # 预期输出 [1,2,3,4]
+    print(rsd_emb.shape)  # 预期形状 (4, hidden_dim)

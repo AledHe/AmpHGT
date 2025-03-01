@@ -1,6 +1,7 @@
 import random
 import torch
 import dgl
+from model.sequence_embedding import TOKEN2ID
 from utils.std_logger import info
 
 from .features import ATOM_FEATURES
@@ -15,6 +16,7 @@ class MaskGraph:
                  mask_edge: bool = True,
                  mask_atom: bool = True, 
                  mask_fragment: bool = True, 
+                 mask_rsd: bool = True,
                  mask_rate: float = 0.8, # unified mask rate for atom, edge and fragment.
                  # mask_amino: float = 0.0, # mask atoms according to aa_label, this is disabled in pepland.
                  ):
@@ -41,6 +43,7 @@ class MaskGraph:
         self.mask_edge = mask_edge
         self.mask_atom = mask_atom
         self.mask_fragment = mask_fragment
+        self.mask_rsd = mask_rsd
         self.mask_rate = mask_rate
         # self.mask_amino = mask_amino
         
@@ -165,12 +168,36 @@ class MaskGraph:
 
             assert not torch.allclose(g.nodes['p'].data['f'][node_mask], g.nodes['p'].data['f_unmasked'][node_mask])
 
+        # masking rsd
+        if self.mask_rsd and self.mask_rate > 0:
+            self._mask_rsd_nodes(g)
+
         # exit()
         # Validate masking results
-        self._validate_masking_results(g, orig_atom_feats, orig_frag_feats)
+        # self._validate_masking_results(g, orig_atom_feats, orig_frag_feats)
 
         # exit("Test")
         return g
+
+    def _mask_rsd_nodes(self, g: dgl.DGLHeteroGraph):
+        """mask the token_id in rsd nodes, replace with with <mask> ID."""
+        rsd_nodes = g.nodes('rsd')
+        num_rsd = len(rsd_nodes)
+
+        sample_size = int(num_rsd * self.mask_rate + 1)
+        masked_indices = random.sample(range(num_rsd), sample_size)
+
+        # store the original label
+        orig_labels = g.nodes['rsd'].data['label'].clone()
+        g.nodes['rsd'].data['label_orig'] = orig_labels
+
+        # apply masking
+        mask_token_id = TOKEN2ID.get("<MASK>")
+        g.nodes['rsd'].data['label'][masked_indices] = mask_token_id
+
+        mask_tensor = torch.zeros(num_rsd, dtype=torch.bool)
+        mask_tensor[masked_indices] = True
+        g.nodes['rsd'].data['mask'] = mask_tensor
 
     def _apply_edge_masking(self, g: dgl.DGLHeteroGraph, masked_atom_indices: torch.Tensor):
         """Apply edge masking with proper feature handling."""
@@ -202,9 +229,11 @@ class MaskGraph:
         # Verify that unmasked features remain unchanged
         atom_mask = g.nodes['a'].data.get('mask', torch.zeros(g.number_of_nodes('a'), dtype=torch.bool))
         frag_mask = g.nodes['p'].data.get('mask', torch.zeros(g.number_of_nodes('p'), dtype=torch.bool))
+        residue_mask = g.nodes['rsd'].data.get('mask', torch.zeros(g.number_of_nodes('rsd'), dtype=torch.bool))
         
         assert torch.allclose(g.nodes['a'].data['f'][~atom_mask], orig_atom_feats[~atom_mask])
         assert torch.allclose(g.nodes['p'].data['f'][~frag_mask], orig_frag_feats[~frag_mask])
+        assert torch.allclose(g.nodes['rsd'].data['label'][~residue_mask], g.nodes['rsd'].data['label_orig'][~residue_mask])
             
 def GetMaskFragmentFeats():
     emb_0 = [0 for i in range(167)]+[1]

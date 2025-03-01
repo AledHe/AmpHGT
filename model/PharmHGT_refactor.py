@@ -1,4 +1,3 @@
-import dgl
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -8,9 +7,9 @@ import copy
 
 import math
 from model.utils import get_func
-from utils.std_logger import info
+from utils.std_logger import error, info
 from .readouts import GlobalPooling, HierAttnReadout
-from model.sequence_embedding import LSTMEncoder, VOCAB_SIZE
+from model.sequence_embedding import ConvTransformerEncoder, VOCAB_SIZE, ResidueEncoder
 
 # dgl graph utils
 def reverse_edge(tensor):
@@ -133,20 +132,32 @@ class Node_GRU(nn.Module):
 
         return graph_embed
 
-def apply_custom_copy_src(g, etype, src_field, out_field, reduce_func):
-    g.send_and_recv(
-        g.edges(etype=etype),
-        message_func=partial(copy_src, src_field=src_field, out_field=out_field),
-        reduce_func=reduce_func,
-        etype=etype
-    )
+class NodeGating(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        # project the concatenated input to a scalar
+        self.gate_proj = nn.Sequential(
+            nn.Linear(2 * input_dim, input_dim),
+            nn.ReLU(),
+            nn.Linear(input_dim, input_dim),
+            nn.Sigmoid()
+        )
 
-def copy_src(edges, src_field, out_field):
-    return {out_field: edges.src[src_field]}
+    def forward(self, feat1, feat2):
+        """ 
+        Args:
+            feat1: (N, hid_dim), `f_{suffix}`
+            feat2: (N, hid_dim), `f_junc_{suffix}`
+        Returns:
+            fused: (N, hid_dim) fused feature
+        """
+        combined = torch.cat([feat1, feat2], dim=-1)  # (N, 2*hid_dim)
+        gate = self.gate_proj(combined)  # gate ∈ [0,1]^hid_dim
+        fused = gate * feat1 + (1 - gate) * feat2
+        return fused # (N, hid_dim)
 
- 
 class MVMP(nn.Module):
-    def __init__(self,msg_func=add_attn,hid_dim=768,depth=9,view='aba',suffix='h',act=nn.ReLU()):
+    def __init__(self,msg_func=add_attn,hid_dim=512,depth=9,view='aba',suffix='h',act=nn.ReLU()):
         """
         MultiViewMassagePassing
         view: a, ap, apj
@@ -159,14 +170,28 @@ class MVMP(nn.Module):
         self.suffix = suffix
         self.msg_func = msg_func
         self.act = act
+        
         self.homo_etypes = [('a','b','a')]
         self.hetero_etypes = []
-        self.node_types = ['a','p']
+        self.node_types = ['a']
+        
         if 'p' in view:
             self.homo_etypes.append(('p','r','p'))
-        if 'j' in view:
-            self.node_types.append('junc')
-            self.hetero_etypes=[('a','j','p'),('p','j','a')] # don't have feature
+            self.node_types.append('p')
+        
+        if 'j' in view and 'a' in view and 'p' in view:
+            self.node_types.append('junc') # junc is not a defined nodes, more like a bipartite edge.
+            self.hetero_etypes.extend([('a','j','p'), ('p','j','a')])
+        
+        if 'r' in view:
+            self.homo_etypes.append(('rsd','s','rsd'))
+            self.node_types.append('rsd')
+            if 'p' in view:
+                self.hetero_etypes.extend([('p','l','rsd'), ('rsd','l','p')])
+
+        info("nodes:", {n for n in self.node_types})
+        info("home_etypes:", {e for e in self.homo_etypes})
+        info("hetero_etypes:", {e for e in self.hetero_etypes})
 
         self.attn = nn.ModuleDict()
         for etype in self.homo_etypes + self.hetero_etypes:
@@ -180,6 +205,11 @@ class MVMP(nn.Module):
         for ntype in self.node_types:
             self.node_last_layer[ntype] = nn.Linear(3*hid_dim,hid_dim)
 
+        self.gated_fusions = nn.ModuleDict({
+            ntype: GatedFusion(hid_dim) 
+            for ntype in ['a', 'p', 'rsd']
+        })
+
     def update_edge(self,edge,layer):
         return {'h':self.act(edge.data['x']+layer(edge.data['m']))}
     
@@ -187,7 +217,7 @@ class MVMP(nn.Module):
         return {field:layer(torch.cat([node.mailbox['mail'].sum(dim=1),
                                        node.data[field],
                                        node.data['f']],1))}
-    
+
     def update_node(self, node, field, layer):
         """
         node : a DGL NodeBatch
@@ -203,7 +233,7 @@ class MVMP(nn.Module):
         concat_input = torch.cat([
             msg_sum,          # aggregated messages from neighbors
             old_feat,         # previous layer embedding
-            node.data['f']    # raw or initial embedding (optional if desired)
+            node.data['f']    # raw or initial embedding
         ], dim=1)
 
         new_feat = layer(concat_input)
@@ -222,71 +252,98 @@ class MVMP(nn.Module):
     def init_edge(self,edge):
         return {'h':edge.data['x'].clone()}
 
+    def get_update_funcs(self, suffix):
+        funcs = {}
+        # homo
+        for e in self.homo_etypes:
+            funcs[e] = (
+                fn.copy_e('h', 'm'),
+                partial(self.msg_func, attn=self.attn[''.join(e)], field=f'f_{suffix}')
+            )
+        # hetero
+        for e in self.hetero_etypes:
+            src_type = e[0]
+            funcs[e] = (
+                fn.copy_u(f'f_junc_{suffix}', 'm'),
+                partial(self.msg_func, attn=self.attn[''.join(e)], field=f'f_junc_{suffix}')
+            )
+        return funcs
 
     def forward(self,bg):
         suffix = self.suffix
-        if  not bg.edges[('p','r','p')].data['x'].numel() and len(self.homo_etypes)>1:
-            self.homo_etypes.remove(('p','r','p'))
-
-
         for ntype in self.node_types:
             if ntype != 'junc':
                 bg.apply_nodes(self.init_node,ntype=ntype)
                 
         for etype in self.homo_etypes:
             bg.apply_edges(self.init_edge,etype=etype)
-
         
         if 'j' in self.view:
             bg.nodes['a'].data[f'f_junc_{suffix}'] = bg.nodes['a'].data['f_junc'].clone()
             bg.nodes['p'].data[f'f_junc_{suffix}'] = bg.nodes['p'].data['f_junc'].clone()
+            bg.nodes['rsd'].data[f'f_junc_{suffix}'] = bg.nodes['rsd'].data['f_junc'].clone()
 
-            
-        update_funcs = {e:(fn.copy_e('h','m'), partial(self.msg_func, attn=self.attn[''.join(e)], field=f'f_{suffix}')) for e in self.homo_etypes }
-        # update_funcs.update({e:(fn.copy_src(f'f_junc_{suffix}','mail'),partial(self.msg_func, attn=self.attn[''.join(e)], field=f'f_junc_{suffix}')) for e in self.hetero_etypes})
-        # update_funcs.update({e:(fn.u_mul_e(f'f_junc_{suffix}',1.0,'m'),partial(self.msg_func, attn=self.attn[''.join(e)], field=f'f_junc_{suffix}')) for e in self.hetero_etypes})
+        # update_funcs = {e:(fn.copy_e('h','m'), partial(self.msg_func, attn=self.attn[''.join(e)], field=f'f_{suffix}')) for e in self.homo_etypes }
 
         # message passing
         for i in range(self.depth-1):
-            bg.multi_update_all(update_funcs,cross_reducer='sum')
-            for e in self.hetero_etypes:
-                apply_custom_copy_src(
-                    bg,
-                    e,
-                    src_field=f'f_junc_{suffix}',
-                    out_field='m',
-                    reduce_func=partial(self.msg_func, attn=self.attn[''.join(e)], field=f'f_junc_{suffix}')
-                )
+            bg.multi_update_all(self.get_update_funcs(self.suffix),cross_reducer='sum')
+            # for e in self.hetero_etypes:
+            #     apply_custom_copy_src(
+            #         bg,
+            #         e,
+            #         src_field=f'f_junc_{suffix}',
+            #         out_field='m',
+            #         reduce_func=partial(self.msg_func, attn=self.attn[''.join(e)], field=f'f_junc_{suffix}')
+            #     )
             for edge_type in self.homo_etypes:
                 bg.edges[edge_type].data['rev_h']=reverse_edge(bg.edges[edge_type].data['h'])
                 bg.apply_edges(partial(del_reverse_message,field=f'f_{suffix}'),etype=edge_type)
                 bg.apply_edges(partial(self.update_edge,layer=self.mp_list[''.join(edge_type)][i]), etype=edge_type)
 
         # last update of node feature
-        update_funcs = {e:(fn.copy_e('h','mail'),partial(self.update_node,field=f'f_{suffix}',layer=self.node_last_layer[e[0]])) for e in self.homo_etypes}
-        bg.multi_update_all(update_funcs,cross_reducer='sum')
+        # update_funcs = {e:(fn.copy_e('h','mail'),partial(self.update_node,field=f'f_{suffix}',layer=self.node_last_layer[e[0]])) for e in self.homo_etypes}
+        # bg.multi_update_all(update_funcs,cross_reducer='sum')
 
-        # last update of junc feature
-        # bg.multi_update_all({e:(fn.copy_src(f'f_junc_{suffix}','mail'),
-        #                          partial(self.update_node,field=f'f_junc_{suffix}',layer=self.node_last_layer['junc'])) for e in self.hetero_etypes},
-        #                          cross_reducer='sum')
-        # bg.multi_update_all({e:(fn.u_mul_e(f'f_junc_{suffix}',1.0,'mail'),
-        #                     partial(self.update_node,field=f'f_junc_{suffix}',layer=self.node_last_layer['junc'])) for e in self.hetero_etypes},
-        #                     cross_reducer='sum')
-        # bg.multi_update_all({e:(partial(copy_src, src_field=f'f_junc_{suffix}', out_field='mail'),
-        #                     partial(self.update_node,field=f'f_junc_{suffix}',layer=self.node_last_layer['junc'])) for e in self.hetero_etypes},
-        #                     cross_reducer='sum')
-        for e in self.hetero_etypes:
-            apply_custom_copy_src(
-                bg,
-                e,
-                src_field=f'f_junc_{suffix}',
-                out_field='mail',
-                reduce_func=partial(self.update_node, field=f'f_junc_{suffix}', layer=self.node_last_layer['junc'])
+        # for e in self.hetero_etypes:
+        #     apply_custom_copy_src(
+        #         bg,
+        #         e,
+        #         src_field=f'f_junc_{suffix}',
+        #         out_field='mail',
+        #         reduce_func=partial(self.update_node, field=f'f_junc_{suffix}', layer=self.node_last_layer['junc'])
+        #     )
+        final_update_funcs = {}
+        for e in self.homo_etypes:
+            dst_type = e[2]
+            final_update_funcs[e] = (
+                fn.copy_e('h', 'mail'),
+                partial(self.update_node, field=f'f_{self.suffix}', layer=self.node_last_layer[dst_type])
             )
+        for e in self.hetero_etypes:
+            dst_type = e[2]
+            final_update_funcs[e] = (
+                fn.copy_u(f'f_junc_{self.suffix}', 'mail'),
+                partial(self.update_node, field=f'f_junc_{self.suffix}', layer=self.node_last_layer['junc'])
+            )
+        bg.multi_update_all(final_update_funcs, cross_reducer='sum')
+        
+        # aftert the last message passing, fusion feature.
+        for ntype in ['a', 'p', 'rsd']:
+            if bg.num_nodes(ntype) == 0:
+                continue
 
+            feat_main = bg.nodes[ntype].data.get(f'f_{self.suffix}')
+            feat_junc = bg.nodes[ntype].data.get(f'f_junc_{self.suffix}')
+
+            if feat_main is None or feat_junc is None:
+                error("feat_main is None or feat_junc is None")
+            
+            fused_feat = self.gated_fusions[ntype](feat_main, feat_junc)
+            bg.nodes[ntype].data['f_final'] = fused_feat # (N, hid_dim)
+        
 class PharmHGT(nn.Module):
-    def __init__(self, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim):
+    def __init__(self, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, device):
         super(PharmHGT,self).__init__()
         # hid_dim = args['hid_dim']
         self.act = get_func(act)
@@ -302,12 +359,22 @@ class PharmHGT(nn.Module):
         # junction view
         self.w_junc = nn.Linear(atom_dim + pharm_dim, hid_dim)
 
+        # residue view
+        self.w_rsd_junc = nn.Linear(hid_dim, hid_dim)
+        self.w_rsd_edge = nn.Linear(1, hid_dim)
+
         ## define the view during massage passing
         # self.mp = MVMP(msg_func=add_attn,hid_dim=hid_dim,depth=self.depth,view='aj',suffix='h',act=self.act)
         # ('a','b','a'), ('p','r','p'), ('a','j','p'), ('p','j','a') are in apj view.
         # so there might no need to run 'a', 'ap' in advance.
-        self.mp = MVMP(msg_func=add_attn,hid_dim=hid_dim,depth=self.depth,view='apj',suffix='h',act=self.act)
+        self.mp = MVMP(msg_func=add_attn, hid_dim=hid_dim, depth=self.depth, view='apjr', suffix='h', act=self.act)
         # self.mp_junc = MVMP(msg_func=add_attn,hid_dim=hid_dim,depth=self.depth,view='apj',suffix='j',act=self.act)
+
+        self.rsd_encoder = ResidueEncoder(
+            vocab_size=VOCAB_SIZE,
+            embed_dim=hid_dim // 2,
+            conv_channels=hid_dim
+        ).to(device=device)
 
         self.initialize_weights()
 
@@ -331,34 +398,56 @@ class PharmHGT(nn.Module):
 
         bg.nodes['a'].data['f_junc'] = self.act(self.w_junc(bg.nodes['a'].data['f_junc']))
         bg.nodes['p'].data['f_junc'] = self.act(self.w_junc(bg.nodes['p'].data['f_junc']))
+
+        # init the rsd_junc here.
+        # make sure the edge feature projects to the proper dimension.
+        if bg.edges[('rsd','s','rsd')].data['x'].size(1) == 1:
+            bg.edges[('rsd','s','rsd')].data['x'] = self.act(self.w_rsd_edge(bg.edges[('rsd','s','rsd')].data['x']))
+        # init the rsd_junc here.
+        if 'f_junc' not in bg.nodes['rsd'].data:
+            dim_rsd = bg.nodes['rsd'].data['f'].size(1)
+            # match the dim
+            junction_dim = bg.nodes['a'].data['f_junc'].size(1)
+            padding_dim = junction_dim - dim_rsd
+            if padding_dim > 0:
+                bg.nodes['rsd'].data['f_junc'] = torch.cat([
+                    torch.zeros(bg.num_nodes('rsd'), padding_dim, 
+                               device=bg.nodes['rsd'].data['f'].device),
+                    bg.nodes['rsd'].data['f']
+                ], 1)
+            else:
+                bg.nodes['rsd'].data['f_junc'] = bg.nodes['rsd'].data['f'].clone()
+
+        bg.nodes['rsd'].data['f_junc'] = self.act(self.w_rsd_junc(bg.nodes['rsd'].data['f_junc']))
         
     def forward(self,bg, finetune=False):
         """
         Args:
             bg: a batch of graphs
         """
+        rsd_emb, cls_emb = self.rsd_encoder(bg) # (num_nodes, conv_channels), (batch_size, conv_channels)
+        bg.nodes['rsd'].data['f'] = rsd_emb # apply new added residue nodes feature by sequence encoder.
+
         self.init_feature(bg)
         self.mp(bg)
         
         if finetune:
-            return bg # return for GNN decoder.
+            return bg, cls_emb
         else:
-            return self.encoder(bg) # if decoder is not MLP, then this is not needed, but a return for unified interface.
+            return self.encoder(bg, cls_emb)
 
-    def encoder(self, bg):
+    def encoder(self, bg, cls_emb):
         """
         Baseline for pretrain.
         Extract embeddings directly from bg and do a simple cat.
         """
-        embed_f_a = bg.nodes['a'].data['f_h']
-        embed_f_p = bg.nodes['p'].data['f_h']
-        # embed_junc_h_a = bg.nodes['a'].data['f_junc_h']
-        # embed_junc_h_p = bg.nodes['p'].data['f_junc_h']
-
-        # embed_a_fused = torch.mean(torch.stack([embed_f_a, embed_junc_h_a], dim=1), dim=1)
-        # mbed_p_fused = torch.mean(torch.stack([embed_f_p, embed_junc_h_p], dim=1), dim=1)
+        embed_f_a = bg.nodes['a'].data['f_final']
+        embed_f_p = bg.nodes['p'].data['f_final']
+        embed_f_rsd = bg.nodes['rsd'].data['f_final']
+        # embed_f_a, embed_f_p, embed_f_rsd: (N, hid_dim), N is the number of nodes in the graph.
+        # torch.Size([1530, 512]) torch.Size([384, 512]) torch.Size([179, 512])
         
-        return embed_f_a, embed_f_p, bg
+        return embed_f_a, embed_f_p, embed_f_rsd, bg, cls_emb
     
 class PharmHGT_FP(nn.Module):
     """
@@ -396,19 +485,12 @@ class PharmHGT_FP(nn.Module):
         if self.readout:
             self.pooling = None
 
-        self.LSTM_seq = LSTMEncoder(
-            vocab_size=VOCAB_SIZE,
-            embed_dim=150,
-            hidden_dim=150,
-            num_layers=2
-        )
-
         if self.cfg.train.readout == 'gru':
-            self.graph_proj = nn.Linear(hid_dim*2, 300)  # 600 -> 300
+            self.graph_proj = nn.Linear(hid_dim*2, hid_dim)
         else:
-            self.graph_proj = nn.Linear(hid_dim, 300) # 300 -> 300
+            self.graph_proj = nn.Linear(hid_dim, hid_dim)
 
-        self.gated_fusion = GatedFusion(embed_dim=300)
+        self.gated_fusion = GatedFusion(embed_dim=hid_dim)
         
         self.mlp = MLP(hid_dim=hid_dim, num_classes=cfg.train.num_tasks, input_dim=hid_dim)
 
@@ -459,9 +541,9 @@ class PharmHGT_FP(nn.Module):
             atom_dim=atom_dim,
             bond_dim=bond_dim,
             pharm_dim=pharm_dim,
-            reac_dim=reac_dim
-        )
-        model.to(device)
+            reac_dim=reac_dim,
+            device=device
+        ).to(device)
 
         if not self.load_pretrained:
             info("No pretrained model loaded. Start training from scratch.")
@@ -484,20 +566,14 @@ class PharmHGT_FP(nn.Module):
 
         return model
     
-    def forward(self, bg, encoded_seqs):
+    def forward(self, bg):
         # embedding extraction
         if self.load_pretrained:
             # do not mess up the pretrained model
             with torch.no_grad():
-                bg = self.pretrain_model(bg, finetune=True)
-                # embed_f_a = bg.nodes['a'].data['f_h'] torch.Size([26623, 300]) # [B * La, D]
-                # embed_f_p = bg.nodes['p'].data['f_h'] torch.Size([6775, 300]) # [B * Lp, D]
+                bg, cls_emb = self.pretrain_model(bg, finetune=True) # cls_emb: (batch_size, conv_channels), conv_channels = hid_dim
         else:
-            bg = self.pretrain_model(bg, finetune=True)
-
-        # sequence embedding
-        seq_features = self.LSTM_seq(encoded_seqs)
-        # seq_features: [batch_size, hidden_dim*2]
+            bg, cls_emb = self.pretrain_model(bg, finetune=True)
 
         # if readout, or pooling
         if self.readout:
@@ -507,7 +583,7 @@ class PharmHGT_FP(nn.Module):
 
         bg_embeds = self.graph_proj(bg_embeds)
 
-        fused_feats = self.gated_fusion(bg_embeds, seq_features)  # (batch_size, hid_dim)
+        fused_feats = self.gated_fusion(bg_embeds, cls_emb)  # (batch_size, hid_dim)
 
         # mlp
         logits = self.mlp(fused_feats)  # => shape [B, num_classes]

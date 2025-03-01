@@ -56,7 +56,7 @@ class Finetune_Trainer(object):
         metrics_tracker = defaultdict(float)
         num_batches = 0
 
-        for step, (batch, label, encoded_seqs) in enumerate(self.dataloaders['train']):
+        for step, (batch, label) in enumerate(self.dataloaders['train']):
             if self.early_stop:
                 # stop training if early stop triggered
                 break
@@ -64,10 +64,9 @@ class Finetune_Trainer(object):
 
             batch = batch.to(self.device) # dgl.batch(list(graphs))
             label = label.to(self.device) # torch.tensor(list(labels), dtype=torch.float32)
-            encoded_seqs = encoded_seqs.to(self.device) # shape=[batch_size, max_len]
 
             # Forward pass through encoder (PharmHGT_FP with pooling), returns bg_embeds.
-            logits = self.model(batch, encoded_seqs)
+            logits = self.model(batch)
 
             # Compute loss
             loss = self.criterion(logits, label.unsqueeze(1))  # shape [batch_size]
@@ -100,13 +99,12 @@ class Finetune_Trainer(object):
         all_trues = []
 
         with torch.no_grad():
-            for step, (batch, label, encoded_seqs) in enumerate(self.dataloaders[stage]):
+            for step, (batch, label) in enumerate(self.dataloaders[stage]):
                 batch = batch.to(self.device) # dgl.batch(list(graphs))
                 label = label.to(self.device) # torch.tensor(list(labels), dtype=torch.float32)
-                encoded_seqs = encoded_seqs.to(self.device) # shape=[batch_size, max_len]
 
                 # Forward pass through encoder (PharmHGT_FP with pooling), returns bg_embeds.
-                logits = self.model(batch, encoded_seqs)
+                logits = self.model(batch)
 
                 # Compute loss
                 loss = self.criterion(logits, label.unsqueeze(1))
@@ -234,7 +232,7 @@ class Finetune_Trainer_RG(object):
         # Training state
         self.epoch = 0
         self.global_train_step = 0
-        self.best_
+        self.best_loss = float("inf")
         self.patience_counter = 0
         self.monitor_steps = cfg.train.get('log_interval', 10)
 

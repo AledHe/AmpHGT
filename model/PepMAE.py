@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict
 
+from model.sequence_embedding import VOCAB_SIZE
+
 class MLPDecoder(nn.Module):
     def __init__(self,
                  hidden_dim: int,
@@ -34,20 +36,23 @@ class MLPDecoder(nn.Module):
         )
         self.atom_classifier = nn.Linear(hidden_dim, num_atom_classes)
         self.fragment_classifier = nn.Linear(hidden_dim, num_fragment_classes)
+        self.residue_classifier = nn.Linear(hidden_dim, VOCAB_SIZE)
 
     def forward(self,
                 bg, 
                 atom_mask: torch.Tensor,
-                fragment_mask: torch.Tensor
+                fragment_mask: torch.Tensor,
+                residue_mask: torch.Tensor
                 ):
         atom_decoded = self.atom_decoder(atom_mask)
         fragment_decoded = self.fragment_decoder(fragment_mask)
 
         atom_class = self.atom_classifier(atom_mask)
         fragment_class = self.fragment_classifier(fragment_mask)
+        residue_class = self.residue_classifier(residue_mask)
 
         feature_decodes = {"atom": atom_decoded, "fragment": fragment_decoded}
-        class_decodes = {"atom": atom_class, "fragment": fragment_class}
+        class_decodes = {"atom": atom_class, "fragment": fragment_class, "residue": residue_class}
 
         return feature_decodes, class_decodes
 
@@ -71,14 +76,18 @@ class HeteroConv(nn.Module):
                 ('a', 'b', 'a'): dglnn.GraphConv(hidden_dim, hidden_dim),
                 ('p', 'r', 'p'): dglnn.GraphConv(hidden_dim, hidden_dim),
                 ('a', 'j', 'p'): dglnn.GraphConv(hidden_dim, hidden_dim),
-                ('p', 'j', 'a'): dglnn.GraphConv(hidden_dim, hidden_dim)
+                ('p', 'j', 'a'): dglnn.GraphConv(hidden_dim, hidden_dim),
+                ('rsd', 's', 'rsd'): dglnn.GraphConv(hidden_dim, hidden_dim),
+                ('rsd', 'l', 'p'): dglnn.GraphConv(hidden_dim, hidden_dim),
+                ('p', 'l', 'rsd'): dglnn.GraphConv(hidden_dim, hidden_dim)
             }, aggregate='mean')  # or 'sum', 'max', etc.
             self.convs.append(conv)
 
             # Layer Normalization
             self.norms.append(nn.ModuleDict({
                 'a': nn.LayerNorm(hidden_dim),
-                'p': nn.LayerNorm(hidden_dim)
+                'p': nn.LayerNorm(hidden_dim),
+                'rsd': nn.LayerNorm(hidden_dim)
             }))
 
         # 2) decode layer
@@ -92,6 +101,7 @@ class HeteroConv(nn.Module):
         # 3) classification layer
         self.atom_classifier = nn.Linear(hidden_dim, num_atom_classes)
         self.frag_classifier = nn.Linear(hidden_dim, num_fragment_classes)
+        self.residue_classifier = nn.Linear(hidden_dim, VOCAB_SIZE)
 
     def forward(self, 
                 bg: dgl.DGLHeteroGraph,
@@ -102,8 +112,9 @@ class HeteroConv(nn.Module):
         """
         # 1) Heterogeneous Convolution
         h = {
-            'a': bg.nodes['a'].data['f_h'],
-            'p': bg.nodes['p'].data['f_h']
+            'a': bg.nodes['a'].data['f_final'],
+            'p': bg.nodes['p'].data['f_final'],
+            'rsd': bg.nodes['rsd'].data['f_final']
         }
 
         for i in range(self.num_layers):
@@ -113,7 +124,8 @@ class HeteroConv(nn.Module):
             # residual connection + layer normalization
             h = {
                 'a': self.norms[i]['a'](h['a'] + F.relu(h_update['a'])),
-                'p': self.norms[i]['p'](h['p'] + F.relu(h_update['p']))
+                'p': self.norms[i]['p'](h['p'] + F.relu(h_update['p'])),
+                'rsd': self.norms[i]['rsd'](h['rsd'] + F.relu(h_update['rsd']))
             }
 
         feature_decodes = {
@@ -123,7 +135,8 @@ class HeteroConv(nn.Module):
         
         class_decodes = {
             'atom': self.atom_classifier(h['a'][bg.nodes['a'].data['mask'] == True]),
-            'fragment': self.frag_classifier(h['p'][bg.nodes['p'].data['mask'] == True])
+            'fragment': self.frag_classifier(h['p'][bg.nodes['p'].data['mask'] == True]),
+            'residue': self.residue_classifier(h['rsd'][bg.nodes['rsd'].data['mask'] == True])
         }
 
         return feature_decodes, class_decodes
@@ -153,14 +166,18 @@ class HeteroAttNet(nn.Module):
                 ('a', 'b', 'a'): dglnn.GATConv(hidden_dim, self.head_dim, num_heads),
                 ('p', 'r', 'p'): dglnn.GATConv(hidden_dim, self.head_dim, num_heads),
                 ('a', 'j', 'p'): dglnn.GATConv(hidden_dim, self.head_dim, num_heads),
-                ('p', 'j', 'a'): dglnn.GATConv(hidden_dim, self.head_dim, num_heads)
+                ('p', 'j', 'a'): dglnn.GATConv(hidden_dim, self.head_dim, num_heads),
+                ('rsd', 's', 'rsd'): dglnn.GATConv(hidden_dim, self.head_dim, num_heads),
+                ('rsd', 'l', 'p'): dglnn.GATConv(hidden_dim, self.head_dim, num_heads),
+                ('p', 'l', 'rsd'): dglnn.GATConv(hidden_dim, self.head_dim, num_heads)
             }, aggregate='mean')
             self.convs.append(conv)
 
             # Layer Normalization
             self.norms.append(nn.ModuleDict({
                 'a': nn.LayerNorm(hidden_dim),
-                'p': nn.LayerNorm(hidden_dim)
+                'p': nn.LayerNorm(hidden_dim),
+                'rsd': nn.LayerNorm(hidden_dim)
             }))
 
         # Decoder layers
@@ -170,11 +187,13 @@ class HeteroAttNet(nn.Module):
         # Classifiers
         self.atom_classifier = nn.Linear(hidden_dim, num_atom_classes)
         self.frag_classifier = nn.Linear(hidden_dim, num_fragment_classes)
+        self.residue_classifier = nn.Linear(hidden_dim, VOCAB_SIZE)
 
     def forward(self, bg):
         h = {
-            'a': bg.nodes['a'].data['f_h'],
-            'p': bg.nodes['p'].data['f_h']
+            'a': bg.nodes['a'].data['f_final'],
+            'p': bg.nodes['p'].data['f_final'],
+            'rsd': bg.nodes['rsd'].data['f_final']
         }
 
         for i in range(self.num_layers):
@@ -187,7 +206,8 @@ class HeteroAttNet(nn.Module):
             # Residual connection and layer norm
             h = {
                 'a': self.norms[i]['a'](h['a'] + F.relu(h_update['a'])),
-                'p': self.norms[i]['p'](h['p'] + F.relu(h_update['p']))
+                'p': self.norms[i]['p'](h['p'] + F.relu(h_update['p'])),
+                'rsd': self.norms[i]['rsd'](h['rsd'] + F.relu(h_update['rsd']))
             }
 
         # Decode features and classify
@@ -198,7 +218,8 @@ class HeteroAttNet(nn.Module):
 
         class_decodes = {
             'atom': self.atom_classifier(h['a'][bg.nodes['a'].data['mask'] == True]),
-            'fragment': self.frag_classifier(h['p'][bg.nodes['p'].data['mask'] == True])
+            'fragment': self.frag_classifier(h['p'][bg.nodes['p'].data['mask'] == True]),
+            'residue': self.residue_classifier(h['rsd'][bg.nodes['rsd'].data['mask'] == True])
         }
 
         return feature_decodes, class_decodes
@@ -235,10 +256,11 @@ class PepMAE(nn.Module):
     def forward(self,
                 bg: dgl.DGLHeteroGraph,
                 atom_mask: torch.Tensor,
-                fragment_mask: torch.Tensor
+                fragment_mask: torch.Tensor,
+                residue_mask: torch.Tensor
                 ):
         if self.decoder_type == "MLP":
-            return self.decoder(bg, atom_mask, fragment_mask)
+            return self.decoder(bg, atom_mask, fragment_mask, residue_mask)
         else:
             return self.decoder(bg)
 
@@ -290,20 +312,23 @@ class PepMAELoss(nn.Module):
         # print(class_decodes["fragment"].shape, class_targets["fragment"].shape)
         atom_class_loss = self.ce(class_decodes["atom"].double(), class_targets["atom"][:, 0])
         frag_class_loss = self.ce(class_decodes["fragment"].double(), class_targets["fragment"])
-        class_loss = atom_class_loss + frag_class_loss
+        rsd_class_loss = self.ce(class_decodes["residue"].double(), class_targets["residue"])
+        class_loss = atom_class_loss + frag_class_loss + rsd_class_loss
 
         total_loss = self.reconstruction_weight * recon_loss \
                    + self.classification_weight * class_loss
         
         atom_acc = self.compute_accuracy(class_decodes["atom"], class_targets["atom"][:, 0])
         frag_acc = self.compute_accuracy(class_decodes["fragment"], class_targets["fragment"])
+        rsd_acc = self.compute_accuracy(class_decodes["residue"], class_targets["residue"])
 
         batch_metrics = {
             "loss": total_loss.item(),
             "recon_loss": recon_loss.item(),
             "class_loss": class_loss.item(),
             "atom_acc": atom_acc,
-            "fragment_acc": frag_acc
+            "fragment_acc": frag_acc,
+            "residue_acc": rsd_acc
         }
 
         return total_loss, batch_metrics

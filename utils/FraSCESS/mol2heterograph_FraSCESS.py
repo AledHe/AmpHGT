@@ -8,11 +8,13 @@ Similar to AdaFrag, but we strictly distinguish between side chains and main cha
 
 import functools
 import random
+import re
 import dgl
 import torch
 
 from typing import List, Optional, Tuple
 
+from model.sequence_embedding import TOKEN2ID
 from utils.features import ATOM_FEATURES, factory, allowable_features
 from utils.std_logger import warning
 from .callMacFrag import call_MacFrag
@@ -21,31 +23,44 @@ from rdkit import Chem
 from rdkit.Chem import MACCSkeys
 from rdkit.Chem.BRICS import FindBRICSBonds
 
+aac_match = re.compile(r"^(.+?)%(\d+)%$")
+
+def parse_residue_name(res_name: str) -> tuple[str, int]:
+    # input: 'Me-Ile%9%'
+    # return: ('Me-Ile', 9)
+    match = aac_match.match(res_name)
+    if match:
+        return match.group(1), int(match.group(2))
+    else:
+        return res_name, -1
+
 def mol2heterograph_frascess(mol: Chem.Mol, sdf_path: str = None, vocab_dict: dict = None) -> dgl.DGLHeteroGraph:
     """
     Convert a RDKit molecule to a DGL heterograph.
     Most code in this function is from PepLand
     """
-    edge_types = [('a', 'b', 'a'), ('p', 'r', 'p'), ('a', 'j', 'p'), ('p', 'j', 'a')]
+    edge_types = [('a', 'b', 'a'), 
+                  ('p', 'r', 'p'), 
+                  ('rsd', 's', 'rsd'), # Residue <-> Residue
+                  ('a', 'j', 'p'), 
+                  ('p', 'j', 'a'),
+                  ('p', 'l', 'rsd'), # Residue -> Fragment
+                  ('rsd', 'l', 'p'), # Fragment -> Residue
+                  ]
+    
     edges = {k: [] for k in edge_types}
 
     # a, b, a: atom-to-atom bonds
     # p, r, p: fragment-to-fragment (pharmacophore-to-pharmacophore) reactions
+    # rsd, s, rsd: residue-to-residue connection sequences.
     # a, j, p: atom-to-fragment junctions, connection from an atoms to the fragment they belongs to.
     # p, j, a: fragment-to-atom junctions, connection from a fragment to the atoms they belongs to.
+    # p, l, rsd: fragment belongs to residue, connection from fragments to residue. l: link
+    # rsd, l, p: residue contains fragment, connection from residue to fragments.
 
-    result_ap, result_p, result_frag, result, brics_bonds_rules, bonds_to_break_all = get_fragment_feats_o(mol, sdf_path=sdf_path)
+    result_ap, result_p, result_frag, result, brics_bonds_rules, bonds_to_break_all, result_frag_rsd = get_fragment_feats_o(mol, sdf_path=sdf_path)
 
-    # result_ap_, result_p_, result_frag_, result_, brics_bonds_rules_, bonds_to_break_all_ = get_fragment_feats_o(mol, sdf_path=sdf_path)
-
-    # print(result_ap == result_ap_, result_p == result_p_, result_frag == result_frag_, result == result_, brics_bonds_rules == brics_bonds_rules_, bonds_to_break_all == bonds_to_break_all_)
-
-    # exit()
-    
-    # atom_frag_label = map_frag_atom_to_mol(mol, bonds_to_break_all)
     atom_frag_label = map_frag_atom_to_mol_o(mol, bonds_to_break_all)
-
-    # assert atom_frag_label == atom_frag_label_
 
     # print("reac_idx", result) [[0, 0, 1], [14, 16, 15],...
     # print("bbr", brics_bonds_rules) [[[0, 1], [0, True, False, False...
@@ -57,7 +72,7 @@ def mol2heterograph_frascess(mol: Chem.Mol, sdf_path: str = None, vocab_dict: di
         edges[('a','b','a')].append([bond.GetBeginAtomIdx(),bond.GetEndAtomIdx()])
         edges[('a','b','a')].append([bond.GetEndAtomIdx(),bond.GetBeginAtomIdx()])
 
-    # beta. fragment view.
+    # beta. fragment view. edges are bonds between fragments
     for r in result:
         begin = r[1]
         end = r[2]
@@ -69,13 +84,42 @@ def mol2heterograph_frascess(mol: Chem.Mol, sdf_path: str = None, vocab_dict: di
         edges[('a','j','p')].append([k,v])
         edges[('p','j','a')].append([v,k])
 
+    # delta. residue view.
+    # records a mapping of (res_name, res_pos) to unique integer IDs for all residues
+    rsd_nodes = {}
+    current_rsd_id = 0
+    UNK_ID = TOKEN2ID.get("<UNK>")
+    # emurating the residue information corresponding to each fragment
+    for p_idx, res_key in result_frag_rsd.items():
+        res_name, res_pos = parse_residue_name(res_key)
+        key = (res_name, res_pos)  # uniquely identifies a residue node by name and position
+
+        if key not in rsd_nodes:
+            # assign a new node ID and record token_id and pos
+            rsd_nodes[key] = {
+                "node_id": current_rsd_id,
+                "token_id": TOKEN2ID.get(res_name, UNK_ID),
+                "pos": res_pos
+            }
+            current_rsd_id += 1
+
+        # p -> rsd, rsd -> p
+        rsd_node_id = rsd_nodes[key]["node_id"]
+        edges[('p','l','rsd')].append([p_idx, rsd_node_id])
+        edges[('rsd','l','p')].append([rsd_node_id, p_idx])
+
+    # connect residue nodes sequentially based on their position.
+    sorted_rsd = sorted(rsd_nodes.items(), key=lambda item: item[1]['pos'])
+    for i in range(len(sorted_rsd) - 1):
+        src_id = sorted_rsd[i][1]['node_id']
+        dst_id = sorted_rsd[i + 1][1]['node_id']
+        edges[('rsd','s','rsd')].append([src_id, dst_id])
+        edges[('rsd','s','rsd')].append([dst_id, src_id])
+
     g = dgl.heterograph(edges)
     # Atom Features
     f_atom = []
     src,dst = g.edges(etype=('a','b','a'))
-
-    # print(src)
-    # print(dst)
 
     atom_label_list = []
     atom_aa_label_list = []
@@ -97,9 +141,6 @@ def mol2heterograph_frascess(mol: Chem.Mol, sdf_path: str = None, vocab_dict: di
         else:
             atom_canmask.append(True)
 
-    # print(atom_canmask)
-
-    # print(f_atom)
     f_atom = torch.FloatTensor(f_atom) # convert the atom features to a tensor.
     g.nodes['a'].data['f'] = f_atom # set the atom features to the graph.
     atom_label_list = torch.LongTensor(atom_label_list) # convert the atom labels to a tensor.
@@ -109,16 +150,6 @@ def mol2heterograph_frascess(mol: Chem.Mol, sdf_path: str = None, vocab_dict: di
                                             # more specifically, the NCC=O struct (all atom) won't be mask.
     atom_aa_label_list = torch.LongTensor(atom_aa_label_list)
     g.nodes['a'].data['aa_label'] = atom_aa_label_list # atom and its corresponding fragment index.
-
-    '''
-    print(Chem.MolToSmiles(mol))
-    print(g.number_of_nodes('a'))
-    print(g.nodes['a'].data['f'], f"Shape: {g.nodes['a'].data['f'].size()}")
-    print(g.nodes['a'].data['label'], f"Shape: {g.nodes['a'].data['label'].size()}")
-    print(g.nodes['a'].data['pep'], f"Shape: {g.nodes['a'].data['pep'].size()}")
-    print(g.nodes['a'].data['aa_label'], f"Shape: {g.nodes['a'].data['aa_label'].size()}")
-    exit()
-    '''
     
     dim_atom = len(f_atom[0])
 
@@ -177,8 +208,28 @@ def mol2heterograph_frascess(mol: Chem.Mol, sdf_path: str = None, vocab_dict: di
 
     g.edges[('p','r','p')].data['x'] = torch.FloatTensor(f_reac)
 
-    # print dim of atom, fragment, and bond features
-    # print(f"Atom Feature Dim: {dim_atom}, Fragment Feature Dim: {dim_pharm}, Bond Feature Dim: {len(f_bond[0])}")
+    # resiude features
+    if rsd_nodes:
+        num_rsd = len(rsd_nodes)
+        token_ids = torch.zeros(num_rsd, dtype=torch.long)
+        positions = torch.zeros(num_rsd, dtype=torch.long)
+        
+        for key, info in rsd_nodes.items():
+            token_ids[info["node_id"]] = info["token_id"]
+            positions[info["node_id"]] = info["pos"]
+        
+        g.nodes['rsd'].data['label'] = token_ids
+        g.nodes['rsd'].data['pos'] = positions
+
+    # pseudo edge features for residue-frag connections
+    edge_feat = torch.ones(g.num_edges(('p', 'l', 'rsd')), 1)
+    g.edges[('p', 'l', 'rsd')].data['x'] = edge_feat
+    g.edges[('rsd', 'l', 'p')].data['x'] = edge_feat
+
+    g.edges[('rsd', 's', 'rsd')].data['x'] = torch.ones(g.num_edges(('rsd', 's', 'rsd')), 1)
+
+    # print(g.nodes['rsd'].data['label']) # tensor([ 94,  13, 163, 107, 107,  17, 107,  19,  22, 107, 115])
+    # print(g.nodes['rsd'].data['pos']) # tensor([ 9, 10,  8,  7,  6,  5,  4,  3,  2,  2,  1])
 
     return g
 
@@ -264,14 +315,59 @@ def map_frag_atom_to_mol(mol: Chem.Mol, bonds_to_break: list):
 
 ### get_fragment_feats
 
+def highlight_atom_with_acc(mol: Chem.Mol):
+    """
+    Highlight the atoms with the property 'aac' in the molecule.
+
+    draw the molecule with the highlighted atoms.
+    """
+    from rdkit.Chem.Draw import rdDepictor
+    from rdkit.Chem import Draw
+
+    rdDepictor.SetPreferCoordGen(True)
+    atom_lst = mol.GetAtoms()
+    atom_idx = []
+    for a in atom_lst:
+        if a.HasProp("aac"):
+            atom_idx.append(a.GetIdx())
+    
+    # draw the molecule with the highlighted atoms
+    img = Draw.MolToImage(mol, highlightAtoms=atom_idx)
+    # show the image
+    img.show()
+
+def determine_frag_rsd_type(mol: Chem.Mol, sdf_path: str) -> Optional[str]:
+    rsd_type = {a.GetProp("aac") for a in mol.GetAtoms() if a.HasProp("aac")}
+    
+    if len(rsd_type) > 1:
+        raise ValueError("Fragment contains two types of amino acid")
+    
+    return next(iter(rsd_type), None)
+
 def get_fragment_feats_o(mol: Chem.Mol, sdf_path: str = None):
+    """
+    Parameters:
+        mol (Chem.Mol): RDKit molecule object representing the molecule to analyze.
+        sdf_path (str, optional): Path to an SDF file (optional, default is None).
+
+    Returns:
+        tuple: A tuple containing multiple dictionaries and lists related to fragment features:
+            - result_ap (dict): A dictionary where each atom ID maps to its corresponding pharmacophore ID.
+            - result_p (dict): A dictionary where each pharmacophore ID maps to its combined feature vector (emb_0 + emb_1).
+            - result_frag (dict): A dictionary where each pharmacophore ID maps to the SMILES string of the corresponding fragment.
+            - result (list): A list of fragment connection bonds, where each entry is a list [bond_idx, begin_atom_idx, end_atom_idx].
+            - brics_bonds_rules (list): A list of bond feature pairs, where each entry is a list [[atom_a_idx, atom_b_idx], features].
+            - bonds_to_break_all (list): A list of all bonds to break in the molecule.
+            - result_frag_rsd (dict): A dictionary where each pharmacophore ID maps to the residue type for the corresponding fragment.
+    """
+    # highlight_atom_with_acc(mol)
     bonds_to_break = get_bond_by_prop(mol)
     bonds_to_break_all, break_bonds_atoms = fragmentize_by_bond(mol, bonds_to_break, sdf_path, FraSCESS=True)
     temp_mol = Chem.FragmentOnBonds(mol, bonds_to_break_all, addDummies=False)
     fragment_idx_list = Chem.GetMolFrags(temp_mol)
     fragment_mol_list = Chem.GetMolFrags(temp_mol, asMols=True)
 
-    result_ap, result_p, result_frag = {}, {}, {}
+    result_ap, result_p, result_frag, result_frag_rsd = {}, {}, {}, {}
     pharm_id = 0
 
     for pharm_id, fragment_idx in enumerate(fragment_idx_list):
@@ -287,6 +383,9 @@ def get_fragment_feats_o(mol: Chem.Mol, sdf_path: str = None):
             warning(f"Failed to generate features for fragment {pharm_id} in {sdf_path}")
         result_p[pharm_id] = emb_0 + emb_1
         result_frag[pharm_id] = Chem.MolToSmiles(mol_pharm, canonical=True)
+
+        rsd_type = determine_frag_rsd_type(mol_pharm, sdf_path)
+        result_frag_rsd[pharm_id] = rsd_type
 
     brics_bonds_set = set()
     brics_bonds_rules = []
@@ -305,7 +404,7 @@ def get_fragment_feats_o(mol: Chem.Mol, sdf_path: str = None):
         if (begin, end) in brics_bonds_set:
             result.append([bond.GetIdx(), begin, end])
 
-    return result_ap, result_p, result_frag, result, brics_bonds_rules, bonds_to_break_all
+    return result_ap, result_p, result_frag, result, brics_bonds_rules, bonds_to_break_all, result_frag_rsd
 
 def get_fragment_feats(mol: Chem.Mol, sdf_path: str = None):
     # get bond to break

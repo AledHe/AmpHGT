@@ -15,7 +15,6 @@ import dgl
 
 from .FraSCESS.mol2heterograph_FraSCESS import mol2heterograph_frascess
 from .RegularMethod.BRICSFrag import mol2heterograph_BRICS
-from model.sequence_embedding import parse_sequence, encode_sequence, TOKEN2ID
 
 from rdkit import Chem
 from torch.utils.data import Dataset, DataLoader, IterableDataset
@@ -160,8 +159,6 @@ class FinetuneDataLoader(Dataset):
         #  - e.g., test  -> [test_sdf_pos, test_sdf_neg]
         self.sdf_paths = self.split_path(stage)
 
-        self.fasta_dict = self.load_fasta()
-
         if cfg.train.train_tag == "generate_vocabdict":
             info("Vocab generation mode. Skipping graph processing.")
             # Just load raw molecules (SMILES) for the entire set
@@ -173,18 +170,6 @@ class FinetuneDataLoader(Dataset):
             self.graphs_labels = []
             for sdf_path in self.sdf_paths:
                 self.graphs_labels.extend(self.mol_to_heterograph(sdf_path))
-
-    def load_fasta(self):
-        """
-        load all fasta in the fasta folder for sequence/title lookup.
-        """
-        # find all fasta files in the fasta folder, get path
-        fasta_files = [os.path.join(self.cfg.data.fasta_dir, f) for f in os.listdir(self.cfg.data.fasta_dir) if f.endswith(".fasta")]
-        # read all fasta files into a dict
-        fasta_dict = {}
-        for fasta_file in fasta_files:
-            fasta_dict.update(read_fasta(fasta_file))
-        return fasta_dict
 
     def split_path(self, stage):
         """
@@ -251,18 +236,12 @@ class FinetuneDataLoader(Dataset):
         chunk_idx = 0
         graphs_batch = []
         labels_batch = []
-        fasta_seq_batch = []
 
         # if cfg defined chunk_size, use it, otherwise use the default value
         if self.cfg.data.chunk_size:
             chunk_size = self.cfg.data.chunk_size
 
         for idx, mol in enumerate(tqdm(mols, desc="Processing molecules", unit="mol")):
-            # retrieve fasta seq using mol.GetProp("_Name")
-            fasta_seq = self.fasta_dict.get(mol.GetProp("_Name"), None)
-            if not fasta_seq:
-                warning(f"Missing fasta sequence for {mol.GetProp('_Name')}")
-                continue
             # Create graph for the molecule based on selected fragmentation method
             if self.cfg.train.frag_method == "FraSCESS":
                 g = mol2heterograph_frascess(mol, mol.GetProp("_Name"), vocab_dict)
@@ -284,23 +263,13 @@ class FinetuneDataLoader(Dataset):
 
             graphs_batch.append(g)
             labels_batch.append(label)
-            fasta_seq_batch.append(fasta_seq)
 
             # If the batch size reaches chunk_size, save it to disk
             if len(graphs_batch) >= chunk_size:
-                # print(f"Graphs batch: {len(graphs_batch)}")
-                # generate_random_string()
-                # exit()
-                # print the first graph of the batch
-                # print(graphs_batch[0])
-                # print detailed information of the first graph
-                # print(graphs_batch[0].ndata)
                 chunk_filename = os.path.join(cache_dir, f"graphs_{self.stage}_chunk_{chunk_idx}.bin")
-                fasta_tensor = torch.tensor(list(pickle.dumps(fasta_seq_batch)), dtype=torch.uint8)
 
                 save_labels = {
                     "labels": torch.tensor(labels_batch),
-                    "fasta_pickle": fasta_tensor
                 }
 
                 dgl.save_graphs(chunk_filename, graphs_batch, save_labels)
@@ -313,16 +282,13 @@ class FinetuneDataLoader(Dataset):
                 chunk_idx += 1
                 graphs_batch = []  # Reset batch for next chunk
                 labels_batch = []
-                fasta_seq_batch = []
 
         # Save any remaining graphs that didn't reach chunk_size
         if graphs_batch:
             chunk_filename = os.path.join(cache_dir, f"graphs_{self.stage}_chunk_{chunk_idx}.bin")
-            fasta_tensor = torch.tensor(list(pickle.dumps(fasta_seq_batch)), dtype=torch.uint8)
 
             save_labels = {
                 "labels": torch.tensor(labels_batch),
-                "fasta_pickle": fasta_tensor
             }
 
             dgl.save_graphs(chunk_filename, graphs_batch, save_labels)
@@ -415,7 +381,6 @@ class FinetuneDataLoader_RG(Dataset):
         chunk_idx = 0
         graphs_batch = []
         values_batch = []
-        fasta_seq_batch = []
 
         if self.cfg.data.chunk_size:
             chunk_size = self.cfg.data.chunk_size
@@ -446,16 +411,13 @@ class FinetuneDataLoader_RG(Dataset):
 
             graphs_batch.append(g)
             values_batch.append(reg_value)
-            fasta_seq_batch.append(fasta_seq)
 
             # If the batch size reaches chunk_size, save it to disk
             if len(graphs_batch) >= chunk_size:
                 chunk_filename = os.path.join(cache_dir, f"graphs_{self.stage}_chunk_{chunk_idx}.bin")
-                fasta_tensor = torch.tensor(list(pickle.dumps(fasta_seq_batch)), dtype=torch.uint8)
 
                 save_values = {
                     "values": torch.tensor(values_batch),
-                    "fasta_pickle": fasta_tensor
                 }
 
                 dgl.save_graphs(chunk_filename, graphs_batch, save_values)
@@ -468,16 +430,13 @@ class FinetuneDataLoader_RG(Dataset):
                 chunk_idx += 1
                 graphs_batch = []  # Reset batch for next chunk
                 values_batch = []
-                fasta_seq_batch = []
 
         # Save any remaining graphs that didn't reach chunk_size
         if graphs_batch:
             chunk_filename = os.path.join(cache_dir, f"graphs_{self.stage}_chunk_{chunk_idx}.bin")
-            fasta_tensor = torch.tensor(list(pickle.dumps(fasta_seq_batch)), dtype=torch.uint8)
 
             save_values = {
                 "values": torch.tensor(values_batch),
-                "fasta_pickle": fasta_tensor
             }
 
             dgl.save_graphs(chunk_filename, graphs_batch, save_values)
@@ -555,39 +514,11 @@ def collate_fn(batch):
     labels = torch.tensor(list(labels), dtype=torch.float32) # Combine all labels into a tensor
     return batched_graph, labels
 
-def collate_fn_with_seq(batch):
-    graphs, labels, seq_strs = zip(*batch) # Unzip the batch into two lists
-    batched_graph = dgl.batch(list(graphs)) # Combine all the graphs into a single batch
-    labels = torch.tensor(list(labels), dtype=torch.float32) # Combine all labels into a tensor
-
-    encoded_seqs = []
-    for i, g in enumerate(graphs):
-        seq_str = seq_strs[i]
-        tokens = parse_sequence(seq_str)
-        seq_ids = encode_sequence(tokens, TOKEN2ID, max_len=100)
-        encoded_seqs.append(seq_ids)
-        
-    # LongTensor: shape = [batch_size, max_len]
-    encoded_seqs = torch.tensor(encoded_seqs, dtype=torch.long)
-
-    return batched_graph, labels, encoded_seqs
-
 def collate_fn_with_reg(batch):
-    graphs, values, seq_strs = zip(*batch)
+    graphs, values = zip(*batch)
     batched_graph = dgl.batch(list(graphs))
     values = torch.tensor(list(values), dtype=torch.float32)
-
-    encoded_seqs = []
-    for i, g in enumerate(graphs):
-        seq_str = seq_strs[i]
-        tokens = parse_sequence(seq_str)
-        seq_ids = encode_sequence(tokens, TOKEN2ID, max_len=100)
-        encoded_seqs.append(seq_ids)
-        
-    # LongTensor: shape = [batch_size, max_len]
-    encoded_seqs = torch.tensor(encoded_seqs, dtype=torch.long)
-
-    return batched_graph, values, encoded_seqs
+    return batched_graph, values
 
 def make_pretrain_loaders(cfg, batch_size):
     # 1) Create datasets for each split
@@ -647,7 +578,7 @@ def make_binary_loaders(cfg, batch_size, mask_graph, inference=False):
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            collate_fn=collate_fn_with_seq,
+            collate_fn=collate_fn,
             num_workers=cfg.data.num_workers,
             pin_memory=True,
             shuffle=True
@@ -655,14 +586,14 @@ def make_binary_loaders(cfg, batch_size, mask_graph, inference=False):
         valid_loader = DataLoader(
             valid_dataset,
             batch_size=batch_size,
-            collate_fn=collate_fn_with_seq,
+            collate_fn=collate_fn,
             num_workers=cfg.data.num_workers,
             pin_memory=True
         )
         test_loader = DataLoader(
             test_dataset,
             batch_size=batch_size,
-            collate_fn=collate_fn_with_seq,
+            collate_fn=collate_fn,
             num_workers=cfg.data.num_workers,
             pin_memory=True
         )
@@ -681,7 +612,7 @@ def make_binary_loaders(cfg, batch_size, mask_graph, inference=False):
         test_loader = DataLoader(
             test_dataset,
             batch_size=batch_size,
-            collate_fn=collate_fn_with_seq,
+            collate_fn=collate_fn,
             num_workers=cfg.data.num_workers,
             pin_memory=True
         )
@@ -784,6 +715,16 @@ def load_graphs(cache_dir):
 
     return graphs_labels
 
+def unzip_atom_residue_mapping(indices_str: str) -> list[int]:
+    indices = []
+    for part in indices_str.split(','):
+        if '-' in part:
+            start, end = map(int, part.split('-'))
+            indices.extend(range(start, end + 1))
+        else:
+            indices.append(int(part))
+    return indices
+
 def read_SMI_file(file_path: str) -> list[Chem.Mol]:
     """
     Read multiple mols from a single SMILES file, and extract bond properties.
@@ -821,7 +762,22 @@ def read_SMI_file(file_path: str) -> list[Chem.Mol]:
                     idx, value = prop.split(':')
                     bond = mol.GetBondWithIdx(int(idx))
                     bond.SetProp("AmideBond", value)
-
+        if mol.HasProp("_Amino_Label"):
+            aac_label_str = mol.GetProp("_Amino_Label")
+            for aac_entry in aac_label_str.split(';'):
+                try:
+                    aac_part, indices_info = aac_entry.split(':[', 1)
+                    indices_str = indices_info.rstrip(']')
+                    
+                    indices = unzip_atom_residue_mapping(indices_str)
+                    
+                    for idx in indices:
+                        atom = mol.GetAtomWithIdx(idx)
+                        atom.SetProp("aac", aac_part)
+                        
+                except Exception as e:
+                    print(f"Error parsing AAC entry '{aac_entry}': {str(e)}")
+                    continue
         mols.append(mol)
 
     if not mols:

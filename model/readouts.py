@@ -5,10 +5,13 @@ import dgl
 import dgl.nn.pytorch as dglnn
 
 from torch import nn
-from torch_scatter import scatter
-from torch.nn import functional as F
 
-from utils.std_logger import error
+from utils.std_logger import error, warning
+
+try:
+    from torch_scatter import scatter
+except ImportError:
+    warning("Please install torch-scatter to enable readout functions.")
 
 # First, we run the effect of the multi-view GNN itself and make a global mean pooling as a baseline; 
 # then we add a Cross-Attn readout that only performs self-attention on (a, p) for comparison.

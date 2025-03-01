@@ -63,10 +63,11 @@ class Masking_Trainer(object):
         
         info(log_str)
 
-    def prepare_mask_targets(self, batch, atom_repr, fragment_repr):
+    def prepare_mask_targets(self, batch, atom_repr, fragment_repr, residue_repr):
         # get masked batch
         atom_mask = atom_repr[batch.nodes['a'].data['mask'] == True]
         fragment_mask = fragment_repr[batch.nodes['p'].data['mask'] == True]
+        residue_mask = residue_repr[batch.nodes['rsd'].data['mask'] == True]
         # get target
         feature_targets = {
             "atom": batch.nodes['a'].data['f_unmasked'][batch.nodes['a'].data['mask'] == True],
@@ -74,10 +75,11 @@ class Masking_Trainer(object):
         }
         class_targets = {
             "atom": batch.nodes['a'].data['label'][batch.nodes['a'].data['mask'] == True],
-            "fragment": batch.nodes['p'].data['label'][batch.nodes['p'].data['mask'] == True]
+            "fragment": batch.nodes['p'].data['label'][batch.nodes['p'].data['mask'] == True],
+            "residue": batch.nodes['rsd'].data['label_orig'][batch.nodes['rsd'].data['mask'] == True]
         }
 
-        return atom_mask, fragment_mask, feature_targets, class_targets
+        return atom_mask, fragment_mask, residue_mask, feature_targets, class_targets
 
     def train_epoch(self):
         """Single training epoch with PepMAE"""
@@ -97,18 +99,18 @@ class Masking_Trainer(object):
             label = label.to(self.device) # -1, 0, 1
 
             # Forward pass through encoder (PharmHGT), returns stacked _h and _junc_h.
-            atom_repr, fragment_repr, bg = self.encoder(batch)
+            atom_repr, fragment_repr, rsd_repr, bg, cls_emb = self.encoder(batch)
             batch = bg
 
             # prepare mask and targets for MLP decoder. other decoder won't use this, return and pass for unified interface.
             # while the targets are used for all encoders.
-            atom_mask, fragment_mask, feature_targets, class_targets = self.prepare_mask_targets(
-                batch, atom_repr, fragment_repr
+            atom_mask, fragment_mask, residue_mask, feature_targets, class_targets = self.prepare_mask_targets(
+                batch, atom_repr, fragment_repr, rsd_repr
             )
 
             # Forward pass through decoder (PepMAE)
             feature_decodes, class_decodes = self.decoder(
-                batch, atom_mask, fragment_mask
+                batch, atom_mask, fragment_mask, residue_mask
             )
 
             # Compute loss
@@ -191,16 +193,16 @@ class Masking_Trainer(object):
                 label = label.to(self.device)
                 
                 # Forward pass through encoder (PharmHGT)
-                atom_repr, fragment_repr, bg = self.encoder(batch)
+                atom_repr, fragment_repr, rsd_repr, bg, cls_emb = self.encoder(batch)
                 batch = bg
                 
-                atom_mask, fragment_mask, feature_targets, class_targets = self.prepare_mask_targets(
-                    batch, atom_repr, fragment_repr
+                atom_mask, fragment_mask, residue_mask, feature_targets, class_targets = self.prepare_mask_targets(
+                    batch, atom_repr, fragment_repr, rsd_repr
                 )
 
                 # Forward pass through decoder (PepMAE)
                 feature_decodes, class_decodes = self.decoder(
-                    batch, atom_mask, fragment_mask
+                    batch, atom_mask, fragment_mask, residue_mask
                 )
 
                 # Compute loss

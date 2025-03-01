@@ -750,11 +750,11 @@ class AmpHGT_FT(PharmHGT_FP):
             **kwargs
         )
 
-    def forward(self, bg, encoded_seqs):
+    def forward(self, bg):
         """ Inference-optimized forward """
         with torch.no_grad():
             # call the parent forward
-            logits = super().forward(bg, encoded_seqs)
+            logits = super().forward(bg)
             return logits
         
     @classmethod

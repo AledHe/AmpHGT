@@ -24,12 +24,11 @@ class Inferencer_Binary(object):
         all_trues = []
 
         with torch.no_grad():
-            for step, (batch, label, encoded_seqs) in enumerate(self.dataloaders["test"]):
+            for step, (batch, label) in enumerate(self.dataloaders["test"]):
                 batch = batch.to(self.device) # dgl.batch(list(graphs))
                 label = label.to(self.device) # torch.tensor(list(labels), dtype=torch.float32)
-                encoded_seqs = encoded_seqs.to(self.device) # shape=[batch_size, max_len]
 
-                logits = self.model(batch, encoded_seqs)
+                logits = self.model(batch)
 
                 logits = torch.sigmoid(logits) # convert logits to probabilities
 

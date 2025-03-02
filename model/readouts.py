@@ -5,6 +5,7 @@ import torch
 import dgl
 
 from torch import nn
+import torch.nn.functional as F
 
 from utils.std_logger import error, warning
 
@@ -202,7 +203,7 @@ class HierAttnReadout(nn.Module):
         # combine different views and project
         unified_embed = torch.cat(pooled_embeddings, dim=-1)
         return self.cross_proj(unified_embed)
-    
+
 class GRUReadout(nn.Module):
     def __init__(self, hid_dim, bidirectional=True):
         super().__init__()
@@ -210,90 +211,70 @@ class GRUReadout(nn.Module):
         self.num_directions = 2 if bidirectional else 1
         
         # cross-attentions
-        self.a_cross_attn = MultiHeadedAttention(h=4, d_model=hid_dim)  # a <-> p
-        self.r_cross_attn = MultiHeadedAttention(h=4, d_model=hid_dim)  # rsd <-> p
+        self.a_cross_attn = MultiHeadedAttention(h=4, d_model=hid_dim)
+        self.r_cross_attn = MultiHeadedAttention(h=4, d_model=hid_dim)
         
         # GRUs
-        self.a_gru = nn.GRU(
-            hid_dim, hid_dim,
-            batch_first=True,
-            bidirectional=bidirectional
-        )
-        self.r_gru = nn.GRU(
-            hid_dim, hid_dim,
-            batch_first=True,
-            bidirectional=bidirectional
-        )
+        self.a_gru = nn.GRU(hid_dim, hid_dim, batch_first=True, bidirectional=bidirectional)
+        self.r_gru = nn.GRU(hid_dim, hid_dim, batch_first=True, bidirectional=bidirectional)
         
-        # fusion layer
-        self.fusion = nn.Linear(
-            hid_dim * self.num_directions * 2,  # a_dim + rsd_dim
-            hid_dim * self.num_directions
-        )
+        # fusion
+        self.fusion = nn.Linear(hid_dim*self.num_directions*2, hid_dim*self.num_directions)
 
     def _batch_pad(self, bg, ntype, field):
         feat = bg.nodes[ntype].data[field]
         node_sizes = bg.batch_num_nodes(ntype)
-        max_len = node_sizes.max().item()
+        max_len = max(node_sizes.max().item(), 1)
         
-        batch_idx = bg.batch_nodes(ntype)
         batch_size = bg.batch_size
         padded = feat.new_zeros(batch_size, max_len, feat.size(-1))
         mask = torch.ones(batch_size, max_len, dtype=torch.bool, device=feat.device)
         
-        # column index tensor
         col = torch.arange(max_len, device=feat.device).expand(batch_size, -1)
         valid = col < node_sizes.unsqueeze(-1)
         
         padded[valid] = feat
-        mask[~valid] = False
+        mask[valid] = False
         return padded, mask, node_sizes
+    
+    def _pool(self, out, mask, sizes, device):
+        mask = ~mask.unsqueeze(-1)  # reverse mask
+        summed = (out * mask).sum(dim=1)
+        lengths = sizes.clamp(min=1).unsqueeze(-1)
+        return summed / lengths.to(device)
+    
+    def _gru_init(self, x, gru):
+        hidden = x.mean(dim=1)  # [B, D]
+        hidden = hidden.repeat(gru.num_layers, 1, 1)  # maybe multiple layers
+        return gru(x, hidden)
+    
+    def _cross_attn(self, query_pad, query_mask, key_pad, key_mask, attn_layer):
+        cross_mask = query_mask.unsqueeze(-1) | key_mask.unsqueeze(1)
+        attended = attn_layer(
+            query=query_pad, key=key_pad, value=key_pad, mask=cross_mask
+        )
+        return query_pad + attended
 
     def forward(self, bg, suffix='final'):
         device = bg.device
 
-        # 1. process 'a' nodes
+        # feature padding
         a_padded, a_mask, a_sizes = self._batch_pad(bg, 'a', f'f_{suffix}')
         p_padded, p_mask, p_sizes = self._batch_pad(bg, 'p', f'f_{suffix}')
-        r_padded, r_mask, r_sizes = self._batch_pad(bg, 'rsd', f'f_{suffix}')  # New
+        r_padded, r_mask, r_sizes = self._batch_pad(bg, 'rsd', f'f_{suffix}')
 
-        # 2. cross-attention for 'a' and 'rsd' nodes with 'p'
-        # original a <-> p interaction
-        a_cross_mask = a_mask.unsqueeze(-1) | p_mask.unsqueeze(1)
-        a_attended = self.a_cross_attn(
-            query=a_padded,
-            key=p_padded,
-            value=p_padded,
-            mask=a_cross_mask
-        )
-        a_updated = a_padded + a_attended
-        
-        # rsd <-> p interaction
-        r_cross_mask = r_mask.unsqueeze(-1) | p_mask.unsqueeze(1)  # [B, Lr, Lp]
-        r_attended = self.r_cross_attn(
-            query=r_padded,
-            key=p_padded,
-            value=p_padded,
-            mask=r_cross_mask
-        )
-        r_updated = r_padded + r_attended  # [B, Lr, D]
+        # cross-attentions
+        a_updated = self._cross_attn(a_padded, a_mask, p_padded, p_mask, self.a_cross_attn)
+        r_updated = self._cross_attn(r_padded, r_mask, p_padded, p_mask, self.r_cross_attn)
 
-        # 3. process with GRUs
-        a_out, _ = self.a_gru(a_updated)  # [B, La, D*num_dir]
-        r_out, _ = self.r_gru(r_updated)  # [B, Lr, D*num_dir]
+        # GRUs
+        a_out, _ = self._gru_init(a_updated, self.a_gru)
+        r_out, _ = self._gru_init(r_updated, self.r_gru)
 
-        # 4. pooling
-        def _pool(out, mask, sizes):
-            lengths = sizes.clamp(min=1)
-            mask = ~mask.unsqueeze(-1)  # [B, L, 1]
-            summed = (out * mask).sum(dim=1)
-            return summed / lengths.unsqueeze(-1).to(device)
+        # aggregate
+        a_embed = self._pool(a_out, a_mask, a_sizes, device)
+        r_embed = self._pool(r_out, r_mask, r_sizes, device)
 
-        a_embed = _pool(a_out, a_mask, a_sizes)  # [B, D*num_dir]
-        r_embed = _pool(r_out, r_mask, r_sizes)  # [B, D*num_dir]
-
-        # 5. fusion
-        combined = torch.cat([a_embed, r_embed], dim=-1)  # [B, 2*D*num_dir]
-        graph_embed = self.fusion(combined)  # [B, D*num_dir]
-        
-        return graph_embed
+        # fusion
+        combined = torch.cat([a_embed, r_embed], dim=-1)
+        return self.fusion(combined)

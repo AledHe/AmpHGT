@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-import torch.nn.functional as F
 from dgl import function as fn
 from functools import partial
 

@@ -1,8 +1,8 @@
 """bunch of readout functions for graph classification"""
-
+import copy
+import math
 import torch
 import dgl
-import dgl.nn.pytorch as dglnn
 
 from torch import nn
 
@@ -68,6 +68,52 @@ def split_batch(bg: dgl.DGLHeteroGraph, ntype: str, field: str, device=None):
     hidden_cat = torch.cat(hidden_lst, dim=0)
     return hidden_cat
 
+# nn modules
+
+def clones(module, N):
+    "Produce N identical layers."
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+
+def attention(query, key, value, mask=None, dropout=None):
+    "Compute 'Scaled Dot Product Attention'"
+    d_k = query.size(-1)
+    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+    if mask is not None:
+        scores = scores.masked_fill(mask, -1e9)
+    p_attn = F.softmax(scores, dim = -1)
+    # p_attn = F.softmax(scores, dim = -1).masked_fill(mask, 0)  # 不影响
+    if dropout is not None:
+        p_attn = dropout(p_attn)
+    return torch.matmul(p_attn, value), p_attn
+
+class MultiHeadedAttention(nn.Module):
+    def __init__(self, h, d_model, dropout=0):
+        "Take in model size and number of heads."
+        super(MultiHeadedAttention, self).__init__()
+        assert d_model % h == 0
+        # We assume d_v always equals d_k
+        self.d_k = d_model // h
+        self.h = h
+        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)
+        
+    def forward(self, query, key, value, mask=None):
+        "Implements Figure 2"
+        if mask is not None:
+            mask = mask.unsqueeze(1)
+        nbatches = query.size(0)
+        query, key, value = \
+            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+             for l, x in zip(self.linears, (query, key, value))]
+
+        x, self.attn = attention(query, key, value, mask=mask, 
+                                 dropout=self.dropout)
+
+        x = x.transpose(1, 2).contiguous() \
+             .view(nbatches, -1, self.h * self.d_k)
+        return self.linears[-1](x)
+
 class GlobalPooling(nn.Module):
     def __init__(self, mode='mean'):
         super().__init__()
@@ -95,60 +141,159 @@ class GlobalPooling(nn.Module):
 
         a_embed = self.batch_pool(bg, 'a', feat_name)  # (B, D)
         p_embed = self.batch_pool(bg, 'p', feat_name)  # (B, D)
+        rsd_embed = self.batch_pool(bg, 'rsd', feat_name)  # (B, D)
 
-        return a_embed + p_embed # (B, D)
+        return a_embed + p_embed + rsd_embed # (B, D)
     
 class HierAttnReadout(nn.Module):
     def __init__(self, hid_dim):
         super().__init__()
-        # atom-view attention parameters
-        self.a_attn = nn.Linear(hid_dim, 1)
-        # pharmacophore-view attention parameters
-        self.p_attn = nn.Linear(hid_dim, 1)
-        # cross-view fusion
-        self.cross_proj = nn.Linear(2*hid_dim, hid_dim)
-
-    def batch_attn_pool(self, feats, attn_weights, batch_indices):
-        # feats: [total_nodes, hid_dim]
-        # attn_weights: [total_nodes, 1]
-        # batch_indices: [total_nodes] reprensenting batch indices for each node
+        # initialize attention layers for different node types
+        self.a_attn = nn.Linear(hid_dim, 1)      # atom-view attention
+        self.p_attn = nn.Linear(hid_dim, 1)      # pharmacophore-view attention
+        self.rsd_attn = nn.Linear(hid_dim, 1)    # residue-view attention
         
-        # calculate weighted sum by graph group
-        w_unorm = attn_weights.exp()  # shape=[N_total,1]
-        # segment sum over batch_indices
-        w_sum = scatter(w_unorm, batch_indices, dim=0, reduce='sum')  # [B,1]
+        # fusion layer combining all views
+        self.cross_proj = nn.Linear(3*hid_dim, hid_dim)
 
-        # expand to node level
-        w_sum_expanded = w_sum[batch_indices]  # [N_total,1]
-        norm_w = w_unorm / (w_sum_expanded + 1e-8)
+    def get_batch_indices(self, bg, ntype):
+        """generate batch indices for specific node type"""
+        device = bg.device
+        batch_counts = bg.batch_num_nodes(ntype).to(device)
+        return torch.repeat_interleave(
+            torch.arange(bg.batch_size, device=device),
+            batch_counts
+        )
 
-        weighted = feats * norm_w
-        return scatter(weighted, batch_indices, dim=0, reduce='sum')  # [B, hid_dim]
+    def batch_attn_pool(self, feats, attn_weights, batch_ids):
+        """attention-based pooling with softmax normalization"""
+        # unnormalized weights using exp for stability
+        unnorm_weights = attn_weights.exp()  # [total_nodes, 1]
+        
+        # compute softmax denominator per graph
+        sum_weights = scatter(unnorm_weights, batch_ids, dim=0, reduce='sum')  # [batch_size, 1]
+        sum_weights = sum_weights[batch_ids]  # expand to node level
+        norm_weights = unnorm_weights / (sum_weights + 1e-8)  # [total_nodes, 1]
+        
+        # apply weighted aggregation
+        weighted_feats = feats * norm_weights
+        return scatter(weighted_feats, batch_ids, dim=0, reduce='sum')  # [batch_size, hid_dim]
 
-    def forward(self, bg, suffix='h'):
+    def forward(self, bg, suffix='final'):
+        # define processing order and corresponding attention layers
+        node_types = ['a', 'p', 'rsd']
+        attn_modules = [self.a_attn, self.p_attn, self.rsd_attn]
+        pooled_embeddings = []
+
+        for ntype, attn_fn in zip(node_types, attn_modules):
+            # get node features and process attention
+            batch_indices = self.get_batch_indices(bg, ntype)
+            node_features = bg.nodes[ntype].data[f'f_{suffix}']
+            attention_scores = attn_fn(node_features)
+            
+            # perform attention pooling
+            graph_embed = self.batch_attn_pool(
+                node_features, 
+                attention_scores,
+                batch_indices
+            )
+            pooled_embeddings.append(graph_embed)
+
+        # combine different views and project
+        unified_embed = torch.cat(pooled_embeddings, dim=-1)
+        return self.cross_proj(unified_embed)
+    
+class GRUReadout(nn.Module):
+    def __init__(self, hid_dim, bidirectional=True):
+        super().__init__()
+        self.hid_dim = hid_dim
+        self.num_directions = 2 if bidirectional else 1
+        
+        # cross-attentions
+        self.a_cross_attn = MultiHeadedAttention(h=4, d_model=hid_dim)  # a <-> p
+        self.r_cross_attn = MultiHeadedAttention(h=4, d_model=hid_dim)  # rsd <-> p
+        
+        # GRUs
+        self.a_gru = nn.GRU(
+            hid_dim, hid_dim,
+            batch_first=True,
+            bidirectional=bidirectional
+        )
+        self.r_gru = nn.GRU(
+            hid_dim, hid_dim,
+            batch_first=True,
+            bidirectional=bidirectional
+        )
+        
+        # fusion layer
+        self.fusion = nn.Linear(
+            hid_dim * self.num_directions * 2,  # a_dim + rsd_dim
+            hid_dim * self.num_directions
+        )
+
+    def _batch_pad(self, bg, ntype, field):
+        feat = bg.nodes[ntype].data[field]
+        node_sizes = bg.batch_num_nodes(ntype)
+        max_len = node_sizes.max().item()
+        
+        batch_idx = bg.batch_nodes(ntype)
+        batch_size = bg.batch_size
+        padded = feat.new_zeros(batch_size, max_len, feat.size(-1))
+        mask = torch.ones(batch_size, max_len, dtype=torch.bool, device=feat.device)
+        
+        # column index tensor
+        col = torch.arange(max_len, device=feat.device).expand(batch_size, -1)
+        valid = col < node_sizes.unsqueeze(-1)
+        
+        padded[valid] = feat
+        mask[~valid] = False
+        return padded, mask, node_sizes
+
+    def forward(self, bg, suffix='final'):
         device = bg.device
 
-        # 1) ============= Atom-view =============
-        # get the batch_indices assigned to node a
-        a_batch_sizes = bg.batch_num_nodes('a').to(device)
-        a_batch_indices = torch.repeat_interleave(
-            torch.arange(bg.batch_size, device=device),
-            a_batch_sizes
-        )
-        a_feats = bg.nodes['a'].data[f'f_{suffix}']  # [N_a_total, hid_dim]
-        a_scores = self.a_attn(a_feats)              # [N_a_total, 1]
-        a_embed  = self.batch_attn_pool(a_feats, a_scores, a_batch_indices)  # [B, hid_dim]
+        # 1. process 'a' nodes
+        a_padded, a_mask, a_sizes = self._batch_pad(bg, 'a', f'f_{suffix}')
+        p_padded, p_mask, p_sizes = self._batch_pad(bg, 'p', f'f_{suffix}')
+        r_padded, r_mask, r_sizes = self._batch_pad(bg, 'rsd', f'f_{suffix}')  # New
 
-        # 2) ============= Pharmacophore-view =============
-        p_batch_sizes = bg.batch_num_nodes('p').to(device)
-        p_batch_indices = torch.repeat_interleave(
-            torch.arange(bg.batch_size, device=device),
-            p_batch_sizes
+        # 2. cross-attention for 'a' and 'rsd' nodes with 'p'
+        # original a <-> p interaction
+        a_cross_mask = a_mask.unsqueeze(-1) | p_mask.unsqueeze(1)
+        a_attended = self.a_cross_attn(
+            query=a_padded,
+            key=p_padded,
+            value=p_padded,
+            mask=a_cross_mask
         )
-        p_feats = bg.nodes['p'].data[f'f_{suffix}']  # [N_p_total, hid_dim]
-        p_scores = self.p_attn(p_feats)              # [N_p_total, 1]
-        p_embed  = self.batch_attn_pool(p_feats, p_scores, p_batch_indices)  # [B, hid_dim]
+        a_updated = a_padded + a_attended
+        
+        # rsd <-> p interaction
+        r_cross_mask = r_mask.unsqueeze(-1) | p_mask.unsqueeze(1)  # [B, Lr, Lp]
+        r_attended = self.r_cross_attn(
+            query=r_padded,
+            key=p_padded,
+            value=p_padded,
+            mask=r_cross_mask
+        )
+        r_updated = r_padded + r_attended  # [B, Lr, D]
 
-        # 3) ============= Cross-view fusion =============
-        combined = torch.cat([a_embed, p_embed], dim=-1)  # [B, 2*hid_dim]
-        return self.cross_proj(combined)                  # [B, hid_dim]
+        # 3. process with GRUs
+        a_out, _ = self.a_gru(a_updated)  # [B, La, D*num_dir]
+        r_out, _ = self.r_gru(r_updated)  # [B, Lr, D*num_dir]
+
+        # 4. pooling
+        def _pool(out, mask, sizes):
+            lengths = sizes.clamp(min=1)
+            mask = ~mask.unsqueeze(-1)  # [B, L, 1]
+            summed = (out * mask).sum(dim=1)
+            return summed / lengths.unsqueeze(-1).to(device)
+
+        a_embed = _pool(a_out, a_mask, a_sizes)  # [B, D*num_dir]
+        r_embed = _pool(r_out, r_mask, r_sizes)  # [B, D*num_dir]
+
+        # 5. fusion
+        combined = torch.cat([a_embed, r_embed], dim=-1)  # [B, 2*D*num_dir]
+        graph_embed = self.fusion(combined)  # [B, D*num_dir]
+        
+        return graph_embed

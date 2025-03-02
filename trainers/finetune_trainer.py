@@ -163,7 +163,7 @@ class Finetune_Trainer(object):
                     info(f"Early stopping triggered after epoch {epoch + 1}.")
                     break
 
-        # test
+        # test the last time
         test_metrics = self.eov_epoch(stage='test')
         self._log_epoch_metrics(train_metrics=None, val_metrics=None, test_metrics=test_metrics, epoch=epoch)
     

@@ -3,13 +3,11 @@ from torch import nn
 import torch.nn.functional as F
 from dgl import function as fn
 from functools import partial
-import copy
 
-import math
 from model.utils import get_func
 from utils.std_logger import error, info
-from .readouts import GlobalPooling, HierAttnReadout
-from model.sequence_embedding import ConvTransformerEncoder, VOCAB_SIZE, ResidueEncoder
+from .readouts import GlobalPooling, HierAttnReadout, MultiHeadedAttention, GRUReadout
+from model.sequence_embedding import VOCAB_SIZE, ResidueEncoder
 
 # dgl graph utils
 def reverse_edge(tensor):
@@ -26,52 +24,6 @@ def del_reverse_message(edge,field):
 def add_attn(node,field,attn):
         feat = node.data[field].unsqueeze(1)
         return {field: (attn(feat,node.mailbox['m'],node.mailbox['m'])+feat).squeeze(1)}
-
-# nn modules
-
-def clones(module, N):
-    "Produce N identical layers."
-    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
-
-def attention(query, key, value, mask=None, dropout=None):
-    "Compute 'Scaled Dot Product Attention'"
-    d_k = query.size(-1)
-    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
-    if mask is not None:
-        scores = scores.masked_fill(mask, -1e9)
-    p_attn = F.softmax(scores, dim = -1)
-    # p_attn = F.softmax(scores, dim = -1).masked_fill(mask, 0)  # 不影响
-    if dropout is not None:
-        p_attn = dropout(p_attn)
-    return torch.matmul(p_attn, value), p_attn
-
-class MultiHeadedAttention(nn.Module):
-    def __init__(self, h, d_model, dropout=0):
-        "Take in model size and number of heads."
-        super(MultiHeadedAttention, self).__init__()
-        assert d_model % h == 0
-        # We assume d_v always equals d_k
-        self.d_k = d_model // h
-        self.h = h
-        self.linears = clones(nn.Linear(d_model, d_model), 4)
-        self.attn = None
-        self.dropout = nn.Dropout(p=dropout)
-        
-    def forward(self, query, key, value, mask=None):
-        "Implements Figure 2"
-        if mask is not None:
-            mask = mask.unsqueeze(1)
-        nbatches = query.size(0)
-        query, key, value = \
-            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
-             for l, x in zip(self.linears, (query, key, value))]
-
-        x, self.attn = attention(query, key, value, mask=mask, 
-                                 dropout=self.dropout)
-
-        x = x.transpose(1, 2).contiguous() \
-             .view(nbatches, -1, self.h * self.d_k)
-        return self.linears[-1](x)
 
 class Node_GRU(nn.Module):
     """GRU for graph readout. Implemented with dgl graph"""
@@ -619,120 +571,6 @@ class MLP(nn.Module):
 
     def forward(self, bg_embeds):
         return self.mlp(bg_embeds)
-    
-class GRUReadout(nn.Module):
-    """
-    Use explicit length-based Mask instead of judging whether the feature is 0.
-    - Split the 'a' and 'p' nodes into (B, Lx, D) forms respectively;
-    - Use node_size_a[i], node_size_p[i] to generate mask;
-    - Perform cross-attention (a => p) or (p => a) in multi-head attention;
-    - Then use GRU to process the sequence and aggregate to get graph-level embedding.
-    """
-    def __init__(self, hid_dim, bidirectional=True):
-        super(GRUReadout, self).__init__()
-        self.hid_dim = hid_dim
-        self.bidirectional = bidirectional
-        self.num_directions = 2 if bidirectional else 1
-        
-        # Cross-Attention: query=a, key=value=p
-        self.cross_attn = MultiHeadedAttention(h=4, d_model=hid_dim)
-        
-        # GRU for sequences: [B, L, hid_dim * num_directions]
-        self.gru = nn.GRU(hid_dim, hid_dim, batch_first=True, 
-                          bidirectional=bidirectional)
-        
-    def _pad_nodes(self, bg, ntype, field, device):
-        """
-        Split the node features of ntype in bg into [B, maxL, hid_dim] and return:
-        - padded_features: zero-padding for each graph
-        - mask: indicates which positions are padding (True means padding, invalid)
-        - node_sizes: vector of length B, the actual number of nodes in each graph
-        """
-        feat = bg.nodes[ntype].data[field]    # [total_num_nodes, hid_dim]
-        node_sizes = bg.batch_num_nodes(ntype)  # [B] node number for each graph
-        max_len = node_sizes.max().item()
-        
-        # prepare a tensor to store zero-padded features
-        padded_features = feat.new_zeros((bg.batch_size, max_len, feat.size(-1)))
-        
-        # prepare a mask at the same time: [B, max_len], True indicates padding position
-        # first default to all True, then mark the real node part as False
-        mask = torch.ones((bg.batch_size, max_len), dtype=torch.bool, device=device)
-        
-        # cumulative index to align feats
-        start_idx = 0
-        for i in range(bg.batch_size):
-            size_i = node_sizes[i].item()
-            if size_i > 0:
-                # take the node vector belonging to the i-th graph
-                cur_feats = feat[start_idx : start_idx + size_i]      # [size_i, hid_dim]
-                padded_features[i, :size_i] = cur_feats
-                # set the mask position corresponding to the valid node part to False
-                mask[i, :size_i] = False
-            start_idx += size_i
-
-        return padded_features, mask, node_sizes
-    
-    def forward(self, bg, suffix='h'):
-        """
-        1) Pad the 'a' and 'p' nodes to (B, La, D) / (B, Lp, D) respectively;
-        2) Perform cross-attention: query=a, key/value=p;
-        - Construct cross_mask to mask the padding part;
-        3) Add the residual with the original feature (optional);
-        4) Process the output with GRU;
-        5) Perform mean or max aggregation on the sequence output according to node_sizes (such as p nodes) to obtain the graph-level vector.
-        """
-        device = bg.device
-        
-        # 1) get the features of nodes a and p and pad them
-        a_padded, a_mask, a_sizes = self._pad_nodes(bg, 'a', f'f_{suffix}', device)
-        p_padded, p_mask, p_sizes = self._pad_nodes(bg, 'p', f'f_{suffix}', device)
-        # a_padded, p_padded: [B, Lmax, hid_dim]
-        # a_mask, p_mask: [B, Lmax] (True => padding)
-        
-        # 2) construct cross_mask, shape [B, La, Lp], True positions are masked in attention
-        # If position a is padding, or position p is padding, set to True
-        # a_mask: (B, La), p_mask: (B, Lp)
-        # cross_mask[b, i, j] = True if (a_mask[b,i] = True or p_mask[b,j] = True)
-        B, La, D = a_padded.shape
-        _, Lp, _ = p_padded.shape
-        
-        a_mask_3d = a_mask.unsqueeze(-1).expand(B, La, Lp)  # (B, La, Lp)
-        p_mask_3d = p_mask.unsqueeze(1).expand(B, La, Lp)  # (B, La, Lp)
-        cross_mask = a_mask_3d | p_mask_3d                 # element-wise OR
-        
-        # 3) do cross-attention: query=a, key=p, value=p
-        # first align the mask dimensions to the attention requirements -> [B, La, Lp]
-        a_updated = self.cross_attn(query=a_padded, key=p_padded, value=p_padded, mask=cross_mask)
-        
-        # residue: a_updated + a_padded
-        a_updated = a_padded + a_updated
-        
-        # 4) process with GRU (B, La, D)
-        # initialize hidden: [num_directions, B, hid_dim]
-        hidden_0 = a_updated.mean(dim=1)  # (B,D)
-        hidden_0 = hidden_0.unsqueeze(0)  # (1,B,D)
-        hidden_0 = hidden_0.repeat(self.num_directions, 1, 1)  # (2,B,D)
-        
-        # run GRU
-        # a_out: [B, La, hid_dim * num_directions]
-        a_out, hidden_n = self.gru(a_updated, hidden_0)
-        
-        # 5) aggregate a_out after unpadding (or aggregate directly on the padded tensor)
-        # do mean pooling on a_out to get the embedding of each graph
-        graph_embed = []
-        for i in range(bg.batch_size):
-            length_i = a_sizes[i].item()
-            # If length_i=0, fill in 0
-            if length_i == 0:
-                graph_embed.append(a_out.new_zeros(1, self.num_directions * self.hid_dim))
-            else:
-                # a_out[i, :length_i], shape=(L_i, hid_dim * dir)
-                g_i = a_out[i, :length_i].mean(dim=0)
-                graph_embed.append(g_i.unsqueeze(0))
-
-        graph_embed = torch.cat(graph_embed, dim=0)  # [B, hid_dim * num_directions]
-        return graph_embed
     
 class AmpHGT_FT(PharmHGT_FP):
     """

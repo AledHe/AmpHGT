@@ -110,7 +110,7 @@ class ResidueEncoder(nn.Module):
         self,
         vocab_size,
         embed_dim=256,
-        max_len=100,
+        max_len=101,
         token2id=None,
         conv_channels=512,
         kernel_size=5,

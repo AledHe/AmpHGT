@@ -16,7 +16,7 @@ try:
     from .FraSCESS.mol2heterograph_FraSCESS import mol2heterograph_frascess
     from .RegularMethod.BRICSFrag import mol2heterograph_BRICS
     # from .Pepland.data import Mol2HeteroGraph as Pepland_Mol2HG
-    from .data_rework import load_vocabdict, read_SMI_file, read_SDF_file
+    from .data_rework import load_vocabdict, read_SMI_file, read_SDF_file, unzip_atom_residue_mapping
     from .seed_device import generate_random_string
 except ImportError as e:
     print(f"Error importing fragmentation methods: {e}. Please ensure the script is run from the correct location or adjust import paths.")
@@ -215,7 +215,7 @@ def read_SMI_file_generator(file_path: str):
     Read the SMILES file line by line, parse it and return a generator.
     Each iteration returns an RDKit Mol object with the corresponding Bond attributes.
     File format example:
-        SMILES!^!_Name!^!_BondProps!^!_AmideBonds
+        SMILES!^!_Name!^!_BondProps!^!_AmideBonds!^!_Amino_Label
 
     :param file_path: Path to the SMILES file
     :return: Generator of RDKit Mol objects
@@ -240,6 +240,7 @@ def read_SMI_file_generator(file_path: str):
 
             bond_props   = splitted[2] if len(splitted) > 2 else ""
             amide_bonds  = splitted[3] if len(splitted) > 3 else ""
+            amino_label  = splitted[4] if len(splitted) > 4 else ""
 
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
@@ -270,6 +271,25 @@ def read_SMI_file_generator(file_path: str):
                         idx, value = prop.split(':')
                         bond = mol.GetBondWithIdx(int(idx))
                         bond.SetProp("AmideBond", value)
+                        
+            if amino_label:
+                if amino_label == '':
+                    pass
+                else:
+                    for aac_entry in amino_label.split(';'):
+                        try:
+                            aac_part, indices_info = aac_entry.split(':[', 1)
+                            indices_str = indices_info.rstrip(']')
+                            
+                            indices = unzip_atom_residue_mapping(indices_str)
+                            
+                            for idx in indices:
+                                atom = mol.GetAtomWithIdx(idx)
+                                atom.SetProp("aac", aac_part)
+                                
+                        except Exception as e:
+                            print(f"Error parsing AAC entry '{aac_entry}': {str(e)}")
+                            continue
 
             # assert Chem.Mol of mol
             # assert isinstance(mol, Chem.Mol)

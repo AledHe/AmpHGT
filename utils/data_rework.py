@@ -710,8 +710,7 @@ def load_graphs(cache_dir):
             graphs, labels_dict = dgl.load_graphs(bin_file) # returns graph_list: list[DGLGraph], labels: dict[str, Tensor]
             os.remove(bin_file)
             labels = labels_dict["labels"].tolist()
-            fasta_seq_loaded = pickle.loads(bytes(labels_dict["fasta_pickle"].tolist()))
-            graphs_labels.extend(zip(graphs, labels, fasta_seq_loaded)) # Combine graphs and labels into tuples
+            graphs_labels.extend(zip(graphs, labels)) # Combine graphs and labels into tuples
 
     return graphs_labels
 

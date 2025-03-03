@@ -9,14 +9,14 @@ train:
   mask_rsd: True
   mask_rate: 0.6 # how many elements in a peptide should be masked.
   batch_size: 16
-  hid_dim: 512
+  hid_dim: 300
   act: "relu"
   depth: 5
   # num_task: 1
   atom_dim: 42 # do not change
   bond_dim: 14 # do not change
   pharm_dim: 196 # do not change
-  rsd_dim: 512
+  rsd_dim: 300
   reac_dim: 14
   num_layer: 5
   lr: 0.001

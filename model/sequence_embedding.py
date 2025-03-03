@@ -40,7 +40,7 @@ class ConvTransformerEncoder(nn.Module):
     def __init__(
         self,
         embed_dim: int = 256,
-        conv_channels: int = 512,
+        conv_channels: int = 256,
         kernel_size: int = 5,
         num_heads: int = 4,
         num_layers: int = 2,
@@ -60,11 +60,11 @@ class ConvTransformerEncoder(nn.Module):
         super().__init__()
         
         # 1D Convolution
-        self.conv1d = nn.Conv1d(
-            in_channels=embed_dim,
-            out_channels=conv_channels,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2
+        self.conv1d = nn.Sequential(
+            nn.Conv1d(embed_dim, conv_channels, kernel_size, padding=kernel_size//2),
+            nn.ReLU(),
+            nn.BatchNorm1d(conv_channels),
+            nn.Dropout(dropout)
         )
         
         # Transformer encoder
@@ -81,7 +81,7 @@ class ConvTransformerEncoder(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, key_padding_mask=None):
         """
         x: [batch_size, seq_len, embed_dim]
         mask: [batch_size, seq_len, seq_len], 1 -> include, 0 -> exclude
@@ -94,15 +94,11 @@ class ConvTransformerEncoder(nn.Module):
         x = self.conv1d(x)     # [batch_size, conv_channels, seq_len]
         x = x.transpose(1, 2)  # [batch_size, seq_len, conv_channels]
 
-        # Construct key-padding mask if needed
-        if mask is not None:
-            # for nn.Transformer, src_key_padding_mask is [batch_size, seq_len],
-            # so we can extract it from diagonal or row sums, etc.
-            key_padding_mask = (mask.sum(dim=-1) == 0) # [batch_size, seq_len]
-        else:
-            key_padding_mask = None
+        out = self.transformer_encoder(
+            x,
+            src_key_padding_mask=key_padding_mask
+        )
 
-        out = self.transformer_encoder(x, src_key_padding_mask=key_padding_mask) # [batch_size, seq_len, conv_channels]
         return out
     
 class ResidueEncoder(nn.Module):
@@ -112,7 +108,7 @@ class ResidueEncoder(nn.Module):
         embed_dim=256,
         max_len=101,
         token2id=None,
-        conv_channels=512,
+        conv_channels=256,
         kernel_size=5,
         num_heads=4,
         num_layers=2,
@@ -139,6 +135,28 @@ class ResidueEncoder(nn.Module):
             ff_dim=ff_dim,
             dropout=dropout
         )
+        self.init_wb()
+
+    def init_wb(self):
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Embedding):
+                nn.init.xavier_uniform_(module.weight)
+                if module.padding_idx is not None:
+                    module.weight.data[module.padding_idx].zero_()
+            elif isinstance(module, nn.Conv1d):
+                # 卷积层使用 He 初始化 + ReLU修正
+                nn.init.kaiming_normal_(
+                    module.weight, 
+                    mode='fan_out',
+                    nonlinearity='relu'
+                )
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                # Transformer 中的线性层使用 Xavier 初始化
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
     
     def _prepare_residue_batch(self, bg):
         # unbatch
@@ -157,15 +175,10 @@ class ResidueEncoder(nn.Module):
                 all_inverse_indices.append(torch.tensor([], device=g.device, dtype=torch.long)) # [0]
                 continue
 
-            # sort by 'pos'
-            sorted_pos, sorted_idx = torch.sort(g.nodes['rsd'].data['pos']) # [num_nodes]
-            original_labels = g.nodes['rsd'].data['label'][sorted_idx] # [num_nodes]
-
-            # insert <CLS>
-            if self.token2id is not None:
-                cls_token_id = self.token2id['<CLS>']
-            else:
-                cls_token_id = 2  # some default
+            # sort by 'pos' and insert cls.
+            sorted_pos, sorted_idx = torch.sort(g.nodes['rsd'].data['pos'])
+            original_labels = g.nodes['rsd'].data['label'][sorted_idx]
+            cls_token_id = self.token2id.get('<CLS>', 2)
 
             cls_token = torch.tensor([cls_token_id], device=original_labels.device) # [1]
             sorted_labels = torch.cat([cls_token, original_labels]) # [1 + num_nodes]
@@ -184,25 +197,25 @@ class ResidueEncoder(nn.Module):
             device=bg.device,
             dtype=torch.long
         ) # [batch_size, max_len]
-        attention_mask = torch.zeros(
-            (batch_size, max_len, max_len),
+        key_padding_mask = torch.ones(
+            (batch_size, max_len),
             device=bg.device,
-            dtype=torch.float
-        ) # [batch_size, max_len, max_len]
+            dtype=torch.bool
+        ) # [batch_size, max_len], True means to be mask
 
         # fill each row
         for i, sorted_labels in enumerate(all_sorted_labels):
-            seq_len = sorted_labels.shape[0]
+            seq_len = len(sorted_labels)
             if seq_len == 0:
                 continue
             padded_labels[i, :seq_len] = sorted_labels
-            attention_mask[i, :seq_len, :seq_len] = 1.0
+            key_padding_mask[i, :seq_len] = False
 
-        return padded_labels, attention_mask, all_inverse_indices, max_len, graphs
+        return padded_labels, key_padding_mask, all_inverse_indices, max_len, graphs
 
     def forward(self, bg):
         # prepare batched residues
-        padded_labels, attention_mask, all_inverse_indices, max_len, graphs = \
+        padded_labels, key_padding_mask, all_inverse_indices, max_len, graphs = \
             self._prepare_residue_batch(bg)
         
         # padded_labels Shape: [batch_size, max_len]
@@ -213,12 +226,11 @@ class ResidueEncoder(nn.Module):
         x = self.pos_emb(x, seq_len=max_len)       # add position embedding
 
         # conv + Transformer
-        encoded = self.encoder(x, mask=attention_mask)  # [batch_size, max_len, conv_channels]
+        encoded = self.encoder(x, key_padding_mask=key_padding_mask)  # [batch_size, max_len, conv_channels]
 
         # recover node-wise features and gather CLS vectors
         rsd_features = []
         cls_features = []
-        idx = 0
 
         for i, g in enumerate(graphs):
             seq_len = len(all_inverse_indices[i]) + 1  # +1 for CLS

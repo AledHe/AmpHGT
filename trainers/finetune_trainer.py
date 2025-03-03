@@ -21,6 +21,7 @@ class Finetune_Trainer(object):
                  dataloaders,
                  model,  # PharmHGT_FP
                  optimizer,
+                 scheduler,
                  device,
                  outputdir,
                  ):
@@ -31,6 +32,7 @@ class Finetune_Trainer(object):
 
         self.model = model
         self.optimizer = optimizer
+        self.scheduler = scheduler
 
         self.criterion = nn.BCEWithLogitsLoss().to(device) # for binary classification
 
@@ -45,7 +47,7 @@ class Finetune_Trainer(object):
 
     def _log_progress(self, metrics: Dict[str, float], step: int, stage: str) -> str:
         """Format metrics for logging"""
-        log_str = f"{stage} Step {step} | "
+        log_str = f"{stage} Step {step}, lr {self.scheduler.get_lr()} | "
         log_str += f"Loss: {metrics['loss']:.4f} | "
         
         info(log_str)
@@ -75,6 +77,7 @@ class Finetune_Trainer(object):
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
+            self.scheduler.step()
 
             metrics_tracker['loss'] += loss.item()
             num_batches += 1
@@ -162,10 +165,6 @@ class Finetune_Trainer(object):
                 if self.patience_counter >= self.cfg.train.patience:
                     info(f"Early stopping triggered after epoch {epoch + 1}.")
                     break
-
-        # test the last time
-        test_metrics = self.eov_epoch(stage='test')
-        self._log_epoch_metrics(train_metrics=None, val_metrics=None, test_metrics=test_metrics, epoch=epoch)
     
     def _log_epoch_metrics(self, train_metrics, val_metrics, test_metrics, epoch):
         """Log metrics for both training and validation"""

@@ -29,6 +29,7 @@ from trainers.finetune_trainer import Finetune_Trainer
 from trainers.inferencer import Inferencer_Binary
 
 from model.PharmHGT_refactor import PharmHGT, PharmHGT_FP, AmpHGT_FT
+from model.scheduler import NoamLR
 # from model.pretrain_heads import PretrainingHeads, PretrainingMetrics, ReconstructionLoss
 
 """
@@ -229,6 +230,15 @@ def finetune_binary_main(cfg: Cfig):
         lr=cfg.train.lr,
         weight_decay=cfg.train.decay
     )
+    scheduler = NoamLR(
+        optimizer=optimizer,
+        warmup_epochs=[2],
+        total_epochs=[cfg.train.epochs],
+        steps_per_epoch=len(finetune_loader["train"]),
+        init_lr=[cfg.train.lr],
+        max_lr=[1e-03],
+        final_lr=[1e-05]
+    )
 
     with mlflow.start_run():
         info("Logging hyper-parameters...")
@@ -242,6 +252,7 @@ def finetune_binary_main(cfg: Cfig):
             dataloaders=finetune_loader, # this is a dict with "train"/"valid"/"test"
             model=model,
             optimizer=optimizer,
+            scheduler=scheduler,
             device=devices,
             outputdir=cfg.logger.log_dir
         )
@@ -300,6 +311,15 @@ def finetune_regression_main(cfg: Cfig):
         lr=cfg.train.lr,
         weight_decay=cfg.train.decay
     )
+    scheduler = NoamLR(
+        optimizer=optimizer,
+        warmup_epochs=[2],
+        total_epochs=[cfg.train.epochs],
+        steps_per_epoch=len(finetune_loader["train"]),
+        init_lr=[cfg.train.lr],
+        max_lr=[1e-03],
+        final_lr=[1e-05]
+    )
 
     with mlflow.start_run():
         info("Logging hyper-parameters...")
@@ -313,6 +333,7 @@ def finetune_regression_main(cfg: Cfig):
             dataloaders=finetune_loader, # this is a dict with "train"/"valid"/"test"
             model=model,
             optimizer=optimizer,
+            scheduler=scheduler,
             device=devices,
             outputdir=cfg.logger.log_dir
         )

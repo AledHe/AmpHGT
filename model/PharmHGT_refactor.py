@@ -5,7 +5,7 @@ from functools import partial
 
 from model.utils import get_func
 from utils.std_logger import error, info
-from .readouts import GlobalPooling, HierAttnReadout, MultiHeadedAttention, GRUReadout
+from .readouts import GlobalPooling, HierAttnReadout, SemanticAttentionReadout, MultiHeadedAttention, GRUReadout
 from model.sequence_embedding import VOCAB_SIZE, ResidueEncoder
 
 # dgl graph utils
@@ -24,88 +24,19 @@ def add_attn(node,field,attn):
         feat = node.data[field].unsqueeze(1)
         return {field: (attn(feat,node.mailbox['m'],node.mailbox['m'])+feat).squeeze(1)}
 
-class Node_GRU(nn.Module):
-    """GRU for graph readout. Implemented with dgl graph"""
-    def __init__(self,hid_dim,bidirectional=True):
-        super(Node_GRU,self).__init__()
-        self.hid_dim = hid_dim
-        if bidirectional:
-            self.direction = 2
-        else:
-            self.direction = 1
-        self.att_mix = MultiHeadedAttention(4,hid_dim)
-        self.gru  = nn.GRU(hid_dim, hid_dim, batch_first=True, 
-                           bidirectional=bidirectional)
-    
-    def split_batch(self, bg, ntype, field, device):
-        hidden = bg.nodes[ntype].data[field]
-        node_size = bg.batch_num_nodes(ntype)
-        start_index = torch.cat([torch.tensor([0],device=device),torch.cumsum(node_size,0)[:-1]])
-        max_num_node = max(node_size)
-        # padding
-        hidden_lst = []
-        for i  in range(bg.batch_size):
-            start, size = start_index[i],node_size[i]
-            assert size != 0, size
-            cur_hidden = hidden.narrow(0, start, size)
-            cur_hidden = torch.nn.ZeroPad2d((0,0,0,max_num_node-cur_hidden.shape[0]))(cur_hidden)
-            hidden_lst.append(cur_hidden.unsqueeze(0))
-
-        hidden_lst = torch.cat(hidden_lst, 0)
-
-        return hidden_lst
-        
-    def forward(self,bg,suffix='h'):
-        """
-        bg: dgl.Graph (batch)
-        hidden states of nodes are supposed to be in field 'h'.
-        """
-        self.suffix = suffix
-        device = bg.device
-        
-        p_pharmj = self.split_batch(bg,'p',f'f_{suffix}',device)
-        a_pharmj = self.split_batch(bg,'a',f'f_{suffix}',device)
-
-        mask = (a_pharmj!=0).type(torch.float32).matmul((p_pharmj.transpose(-1,-2)!=0).type(torch.float32))==0
-        h = self.att_mix(a_pharmj, p_pharmj, p_pharmj,mask) + a_pharmj
-
-        hidden = h.max(1)[0].unsqueeze(0).repeat(self.direction,1,1)
-        h, hidden = self.gru(h, hidden)
-        
-        # unpadding and reduce (mean) h: batch * L * hid_dim
-        graph_embed = []
-        node_size = bg.batch_num_nodes('p')
-        start_index = torch.cat([torch.tensor([0],device=device),torch.cumsum(node_size,0)[:-1]])
-        for i  in range(bg.batch_size):
-            start, size = start_index[i],node_size[i]
-            graph_embed.append(h[i, :size].view(-1, self.direction*self.hid_dim).mean(0).unsqueeze(0))
-        graph_embed = torch.cat(graph_embed, 0)
-
-        return graph_embed
-
-class NodeGating(nn.Module):
-    def __init__(self, input_dim):
+class NodeFusion(nn.Module):
+    def __init__(self, hidden_dim):
         super().__init__()
-        # project the concatenated input to a scalar
-        self.gate_proj = nn.Sequential(
-            nn.Linear(2 * input_dim, input_dim),
-            nn.ReLU(),
-            nn.Linear(input_dim, input_dim),
-            nn.Sigmoid()
-        )
-
-    def forward(self, feat1, feat2):
-        """ 
-        Args:
-            feat1: (N, hid_dim), `f_{suffix}`
-            feat2: (N, hid_dim), `f_junc_{suffix}`
-        Returns:
-            fused: (N, hid_dim) fused feature
-        """
-        combined = torch.cat([feat1, feat2], dim=-1)  # (N, 2*hid_dim)
-        gate = self.gate_proj(combined)  # gate ∈ [0,1]^hid_dim
-        fused = gate * feat1 + (1 - gate) * feat2
-        return fused # (N, hid_dim)
+        self.ln = nn.LayerNorm(hidden_dim)
+        self.gate_linear = nn.Linear(hidden_dim * 2, hidden_dim)
+    
+    def forward(self, feat_main, feat_junc):
+        # feat_main, feat_junc: (N, hidden_dim)
+        cat_feat = torch.cat([feat_main, feat_junc], dim=-1)  # (N, 2 * hidden_dim)
+        gate = torch.sigmoid(self.gate_linear(cat_feat))      # (N, hidden_dim)
+        fused = gate * feat_main + (1 - gate) * feat_junc
+        fused = self.ln(fused)
+        return fused
 
 class MVMP(nn.Module):
     def __init__(self,msg_func=add_attn,hid_dim=512,depth=9,view='aba',suffix='h',act=nn.ReLU()):
@@ -156,8 +87,8 @@ class MVMP(nn.Module):
         for ntype in self.node_types:
             self.node_last_layer[ntype] = nn.Linear(3*hid_dim,hid_dim)
 
-        self.gated_fusions = nn.ModuleDict({
-            ntype: GatedFusion(hid_dim) 
+        self.nodefusion = nn.ModuleDict({
+            ntype: NodeFusion(hid_dim) 
             for ntype in ['a', 'p', 'rsd']
         })
 
@@ -290,7 +221,7 @@ class MVMP(nn.Module):
             if feat_main is None or feat_junc is None:
                 error("feat_main is None or feat_junc is None")
             
-            fused_feat = self.gated_fusions[ntype](feat_main, feat_junc)
+            fused_feat = self.nodefusion[ntype](feat_main, feat_junc)
             bg.nodes[ntype].data['f_final'] = fused_feat # (N, hid_dim)
         
 class PharmHGT(nn.Module):
@@ -323,21 +254,22 @@ class PharmHGT(nn.Module):
 
         self.rsd_encoder = ResidueEncoder(
             vocab_size=VOCAB_SIZE,
-            embed_dim=hid_dim // 2,
-            conv_channels=hid_dim
+            embed_dim=hid_dim,
+            conv_channels=hid_dim,
+            ff_dim=hid_dim * 4,
         ).to(device=device)
 
         self.initialize_weights()
 
     def initialize_weights(self):
-        for param in self.parameters():
+        for name, param in self.named_parameters():
+            if 'rsd_encoder' in name:
+                continue
+
             if param.dim() == 1:
-                nn.init.constant_(param, 0)
+                nn.init.constant_(param, 0.0)
             else:
-                if self.act == nn.ReLU:
-                    nn.init.kaiming_normal_(param, mode='fan_in', nonlinearity='relu')
-                else:
-                    nn.init.xavier_normal_(param)
+                nn.init.xavier_normal_(param)
 
     def init_feature(self, bg):
         
@@ -416,10 +348,12 @@ class PharmHGT_FP(nn.Module):
         self.reac_dim = reac_dim
         self.load_pretrained = load_pretrained
 
-        if self.cfg.train.readout == 'att':
+        if self.cfg.train.readout == 'har':
             self.readout = HierAttnReadout(hid_dim)
         elif self.cfg.train.readout == 'gru':
             self.readout = GRUReadout(hid_dim)
+        elif self.cfg.train.readout == 'sar':
+            self.readout = SemanticAttentionReadout(hid_dim)
         elif self.cfg.train.readout == 'none':
             self.readout = None
 
@@ -436,16 +370,14 @@ class PharmHGT_FP(nn.Module):
         if self.readout:
             self.pooling = None
 
-        if self.cfg.train.readout == 'gru':
-            self.graph_proj = nn.Linear(hid_dim*2, hid_dim)
+        if self.cfg.train.fusion == 'gate':
+            self.fusion = GatedFusion(embed_dim=hid_dim)
+        elif self.cfg.train.fusion == 'bilinear':
+            self.fusion = BilinearFusion(embed_dim=hid_dim)
         else:
-            self.graph_proj = nn.Linear(hid_dim, hid_dim)
-
-        self.gated_fusion = GatedFusion(embed_dim=hid_dim)
-        
+            raise ValueError(f"Invalid pooling method: {self.cfg.train.fusion}")
+            
         self.mlp = MLP(hid_dim=hid_dim, num_classes=cfg.train.num_tasks, input_dim=hid_dim)
-
-        self.initialize_weights()
 
         self.pretrain_model = self.load_model(
             checkpoint_path=self.cfg.train.checkpoint_path,
@@ -458,20 +390,6 @@ class PharmHGT_FP(nn.Module):
             reac_dim=self.reac_dim,
             device=device
         )
-
-        if not load_pretrained:
-            # init again, this will retrain PharmHGT on finetune data.
-            self.initialize_weights()
-
-    def initialize_weights(self):
-        for param in self.parameters():
-            if param.dim() == 1:
-                nn.init.constant_(param, 0)
-            else:
-                if self.act == nn.ReLU:
-                    nn.init.kaiming_normal_(param, mode='fan_in', nonlinearity='relu')
-                else:
-                    nn.init.xavier_normal_(param)
 
     def load_model(
             self,
@@ -532,9 +450,11 @@ class PharmHGT_FP(nn.Module):
         else:
             bg_embeds = self.pooling(bg)   # (batch_size, hid_dim)
 
-        bg_embeds = self.graph_proj(bg_embeds)
+        fused_feats = self.fusion(bg_embeds, cls_emb)  # (batch_size, hid_dim)
 
-        fused_feats = self.gated_fusion(bg_embeds, cls_emb)  # (batch_size, hid_dim)
+        # info("bg_embeds均值:", bg_embeds.mean().item())
+        # info("cls_emb均值:", cls_emb.mean().item())
+        # info("融合后特征均值:", fused_feats.mean().item(), st=5)
 
         # mlp
         logits = self.mlp(fused_feats)  # => shape [B, num_classes]
@@ -556,12 +476,26 @@ class GatedFusion(nn.Module):
         out = gate * feat1 + (1.0 - gate) * feat2
         return out
     
+class BilinearFusion(nn.Module):
+    def __init__(self, embed_dim):
+        super(BilinearFusion, self).__init__()
+        self.linear = nn.Linear(embed_dim * embed_dim, embed_dim)
+    
+    def forward(self, feat1, feat2):
+        # feat1, feat2: (B, D)
+        outer_product = torch.bmm(feat1.unsqueeze(2), feat2.unsqueeze(1))
+        B, D, _ = outer_product.size()
+        fused = outer_product.view(B, -1)
+        fused = self.linear(fused)
+        return fused
+    
 class MLP(nn.Module):
     """feed bg_embeds to MLP and give binary classification, note that num_classes=1"""
     def __init__(self, hid_dim, num_classes, input_dim):
         super(MLP,self).__init__()
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hid_dim),
+            nn.BatchNorm1d(hid_dim),
             nn.ReLU(),
             nn.Linear(hid_dim, hid_dim // 2),
             nn.ReLU(),

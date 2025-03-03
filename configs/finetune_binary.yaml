@@ -6,28 +6,30 @@ train:
   mask_edge: False
   mask_atom: True
   mask_fragment: True
+  mask_rsd: True
   mask_rate: 0.6 # how many atoms in a peptide should be masked.
   batch_size: 128
   hid_dim: 300
   act: "relu"
   depth: 5
-  num_task: 1
   atom_dim: 42 # do not change
   bond_dim: 14 # do not change
   pharm_dim: 196 # do not change
+  rsd_dim: 300
   reac_dim: 14
   num_layer: 5
   num_tasks: 1
-  lr: 0.001
+  lr: 0.01
   decay: 0
   epochs: 200
   patience: 10
   frag_method: "FraSCESS"
   train_tag: "s2_finetune"
-  load_pretrained: True # if not, train from scratch on finetune data
-  readout: "gru" # "att": HierAttnReadout, "gru": GRUReadout, "": no readout
+  load_pretrained: False # if not, train from scratch on finetune data
+  readout: "gru" # "har": HierAttnReadout, "gru": GRUReadout. "sar": SemanticAttentionReadout, "": no readout
   pooling: "mean" # works when not gru/att readout, mean, max, sum
-  checkpoint_path: out_pretrain/02-16-00-07/checkpoint_epoch_0_step_3000/model.pt
+  fusion: "bilinear"
+  checkpoint_path: ""
 
 data:
   vocablist: tokenizer/vocablist/vocab_1.json

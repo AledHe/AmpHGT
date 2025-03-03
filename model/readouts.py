@@ -98,6 +98,10 @@ class MultiHeadedAttention(nn.Module):
         self.linears = clones(nn.Linear(d_model, d_model), 4)
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
+
+        for linear in self.linears:
+            nn.init.normal_(linear.weight, mean=0, std=(d_model ** -0.5))
+            nn.init.zeros_(linear.bias)
         
     def forward(self, query, key, value, mask=None):
         "Implements Figure 2"
@@ -137,7 +141,7 @@ class GlobalPooling(nn.Module):
             error(f'Invalid pooling mode: {self.mode}')
         return pooled
     
-    def forward(self, bg: dgl.DGLHeteroGraph, suffix='h'):
+    def forward(self, bg: dgl.DGLHeteroGraph, suffix='final'):
         feat_name = f'f_{suffix}'
 
         a_embed = self.batch_pool(bg, 'a', feat_name)  # (B, D)
@@ -156,6 +160,13 @@ class HierAttnReadout(nn.Module):
         
         # fusion layer combining all views
         self.cross_proj = nn.Linear(3*hid_dim, hid_dim)
+
+        for attn_layer in [self.a_attn, self.p_attn, self.rsd_attn]:
+            nn.init.normal_(attn_layer.weight, std=0.01)
+            nn.init.zeros_(attn_layer.bias)
+
+        nn.init.xavier_uniform_(self.cross_proj.weight)
+        nn.init.zeros_(self.cross_proj.bias)
 
     def get_batch_indices(self, bg, ntype):
         """generate batch indices for specific node type"""
@@ -203,6 +214,77 @@ class HierAttnReadout(nn.Module):
         # combine different views and project
         unified_embed = torch.cat(pooled_embeddings, dim=-1)
         return self.cross_proj(unified_embed)
+    
+class SemanticAttentionReadout(nn.Module):
+    def __init__(self, hid_dim, attn_heads=4):
+        super().__init__()
+        self.hid_dim = hid_dim
+
+        # 1. 分类型注意力池化（Step 1）
+        self.type_attn = nn.ModuleDict({
+            'a': MultiHeadedAttention(h=attn_heads, d_model=hid_dim),
+            'p': MultiHeadedAttention(h=attn_heads, d_model=hid_dim),
+            'rsd': MultiHeadedAttention(h=attn_heads, d_model=hid_dim),
+        })
+
+        # 2. 类型间注意力（Step 2）
+        self.semantic_attn = nn.Sequential(
+            nn.Linear(hid_dim, hid_dim),
+            nn.Tanh(),
+            nn.Linear(hid_dim, 1, bias=False)
+        )
+
+        # 初始化参数
+        for attn in self.type_attn.values():
+            nn.init.xavier_normal_(attn[0].weight)
+            nn.init.xavier_normal_(attn[2].weight)
+        nn.init.xavier_normal_(self.semantic_attn[0].weight)
+        nn.init.xavier_normal_(self.semantic_attn[2].weight)
+
+    def get_batch_indices(self, bg, ntype):
+        """生成每个节点对应的图索引（batch内第几个图）"""
+        counts = bg.batch_num_nodes(ntype).to(bg.device)
+        return torch.repeat_interleave(
+            torch.arange(bg.batch_size, device=bg.device),
+            counts
+        )
+
+    def type_wise_pool(self, bg, ntype):
+        """对指定类型的节点做注意力池化"""
+        if bg.num_nodes(ntype) == 0:
+            # 若该类型无节点，返回全零向量
+            return torch.zeros(bg.batch_size, self.hid_dim, device=bg.device)
+        
+        feats = bg.nodes[ntype].data['f_final']  # [num_nodes, hid_dim]
+        batch_indices = self.get_batch_indices(bg, ntype)  # [num_nodes]
+
+        # 计算注意力得分（带非线性）
+        attn_scores = self.type_attn[ntype](feats)  # [num_nodes, 1]
+        attn_scores = attn_scores.squeeze(-1)       # [num_nodes]
+
+        # 按图做 softmax 并加权求和
+        weights = F.softmax(attn_scores, dim=0)    # [num_nodes]
+        weighted_feats = feats * weights.unsqueeze(-1)
+        pooled = scatter(weighted_feats, batch_indices, dim=0, reduce='sum')
+        return pooled  # [batch_size, hid_dim]
+
+    def forward(self, bg):
+        # Step 1: 分别池化三种节点类型
+        a_pool = self.type_wise_pool(bg, 'a')  # [B, D]
+        p_pool = self.type_wise_pool(bg, 'p')  # [B, D]
+        rsd_pool = self.type_wise_pool(bg, 'rsd')  # [B, D]
+
+        # Step 2: 对三种池化结果做语义级注意力
+        pooled_list = [a_pool, p_pool, rsd_pool]
+        pooled_matrix = torch.stack(pooled_list, dim=1)  # [B, 3, D]
+
+        # 计算语义级注意力得分
+        attn_scores = self.semantic_attn(pooled_matrix)  # [B, 3, 1]
+        attn_scores = F.softmax(attn_scores, dim=1)      # [B, 3, 1]
+
+        # 加权求和
+        graph_emb = (pooled_matrix * attn_scores).sum(dim=1)  # [B, D]
+        return graph_emb
 
 class GRUReadout(nn.Module):
     def __init__(self, hid_dim, bidirectional=True):
@@ -218,8 +300,17 @@ class GRUReadout(nn.Module):
         self.a_gru = nn.GRU(hid_dim, hid_dim, batch_first=True, bidirectional=bidirectional)
         self.r_gru = nn.GRU(hid_dim, hid_dim, batch_first=True, bidirectional=bidirectional)
         
-        # fusion
-        self.fusion = nn.Linear(hid_dim*self.num_directions*2, hid_dim*self.num_directions)
+        self.linear_out = nn.Linear(hid_dim*2, hid_dim)
+
+        for gru in [self.a_gru, self.r_gru]:
+            for name, param in gru.named_parameters():
+                if 'weight' in name:
+                    nn.init.orthogonal_(param)  # 正交初始化
+                elif 'bias' in name:
+                    nn.init.zeros_(param)
+
+        nn.init.xavier_uniform_(self.linear_out.weight)
+        nn.init.zeros_(self.linear_out.bias)
 
     def _batch_pad(self, bg, ntype, field):
         feat = bg.nodes[ntype].data[field]
@@ -243,11 +334,6 @@ class GRUReadout(nn.Module):
         lengths = sizes.clamp(min=1).unsqueeze(-1)
         return summed / lengths.to(device)
     
-    def _gru_init(self, x, gru):
-        hidden = x.mean(dim=1)  # [B, D]
-        hidden = hidden.repeat(gru.num_layers, 1, 1)  # maybe multiple layers
-        return gru(x, hidden)
-    
     def _cross_attn(self, query_pad, query_mask, key_pad, key_mask, attn_layer):
         cross_mask = query_mask.unsqueeze(-1) | key_mask.unsqueeze(1)
         attended = attn_layer(
@@ -264,17 +350,14 @@ class GRUReadout(nn.Module):
         r_padded, r_mask, r_sizes = self._batch_pad(bg, 'rsd', f'f_{suffix}')
 
         # cross-attentions
-        a_updated = self._cross_attn(a_padded, a_mask, p_padded, p_mask, self.a_cross_attn)
-        r_updated = self._cross_attn(r_padded, r_mask, p_padded, p_mask, self.r_cross_attn)
+        a_from_p = self._cross_attn(a_padded, a_mask, p_padded, p_mask, self.a_cross_attn)  # [B, La, hid_dim]
+        a_from_r = self._cross_attn(a_padded, a_mask, r_padded, r_mask, self.r_cross_attn)  # [B, La, hid_dim]
+        a_updated = (a_from_p + a_from_r) * 0.5
 
         # GRUs
-        a_out, _ = self._gru_init(a_updated, self.a_gru)
-        r_out, _ = self._gru_init(r_updated, self.r_gru)
+        a_out, _ = self.a_gru(a_updated) # [B, La, hid_dim*2]
 
         # aggregate
-        a_embed = self._pool(a_out, a_mask, a_sizes, device)
-        r_embed = self._pool(r_out, r_mask, r_sizes, device)
+        a_embed = self._pool(a_out, a_mask, a_sizes, device)  # [B, hid_dim*2]
 
-        # fusion
-        combined = torch.cat([a_embed, r_embed], dim=-1)
-        return self.fusion(combined)
+        return self.linear_out(a_embed)

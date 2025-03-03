@@ -142,6 +142,7 @@ class Masking_Trainer(object):
             interval_samples += 1
             
             # Log progress
+            self.global_train_step += 1
             if self.global_train_step % self.monitor_steps == 0:
                 current_metrics = {
                     k: v/interval_samples

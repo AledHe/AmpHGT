@@ -24,7 +24,7 @@ class Masking_Trainer(object):
                  device,
                  outputdir,
                  reconstruction_weight=1.0,
-                 classification_weight=0.75
+                 classification_weight=1.0
                  ):
         self.cfg = cfg
         self.dataloaders = dataloaders
@@ -86,7 +86,10 @@ class Masking_Trainer(object):
         self.encoder.train()
         self.decoder.train()
         
-        metrics_tracker = defaultdict(float)
+        epoch_metrics = defaultdict(float)
+        interval_metrics = defaultdict(float)
+        interval_samples = 0
+
         num_batches = 0
 
         for step, (batch, label) in enumerate(self.dataloaders['train']):
@@ -133,14 +136,21 @@ class Masking_Trainer(object):
 
             # Update metrics
             for name, value in batch_metrics.items():
-                metrics_tracker[name] += value
+                epoch_metrics[name] += value
+                interval_metrics[name] += value
             num_batches += 1
-
+            interval_samples += 1
+            
             # Log progress
-            self.global_train_step += 1
             if self.global_train_step % self.monitor_steps == 0:
-                current_metrics = {k: v/num_batches for k, v in metrics_tracker.items()}
+                current_metrics = {
+                    k: v/interval_samples
+                    for k, v in interval_metrics.items()
+                }
                 self._log_progress(current_metrics, step, "train")
+                
+                interval_metrics.clear()
+                interval_samples = 0
 
             # -----------------------------
             # every val_interval steps, run validation
@@ -150,7 +160,7 @@ class Masking_Trainer(object):
                 if self.early_stop:
                     break
 
-        return {k: v/num_batches for k, v in metrics_tracker.items()}
+        return {k: v/num_batches for k, v in epoch_metrics.items()}
     
     def in_train_validate(self):
         """

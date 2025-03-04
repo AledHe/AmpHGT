@@ -14,7 +14,6 @@ See LICENSE file in the project root for full license information.
 import os
 import mlflow
 import torch.optim as optim
-import shutil
 import argparse
 
 from model.PepMAE import PepMAE
@@ -95,9 +94,6 @@ def pretrain_main(cfg: Cfig):
     ensure_dir_exists(cfg.logger.log_dir)
 
     initialize_logger(cfg.logger.log_dir)
-
-    # copy the config file to the log directory
-    shutil.copy('configs/pretrain.yaml', os.path.join(cfg.logger.log_dir, "pretrain.yaml"))
 
     # Initialize the random seed and device configuration for reproducibility
     devices = setup_seed_reproducibility(cfg.train.seed, cfg.train.cuda_deterministic)
@@ -180,9 +176,6 @@ def finetune_binary_main(cfg: Cfig):
 
     initialize_logger(cfg.logger.log_dir)
 
-    # copy the config file to the log directory
-    shutil.copy('configs/finetune_binary.yaml', os.path.join(cfg.logger.log_dir, "finetune_binary.yaml"))
-
     # Initialize the random seed and device configuration for reproducibility
     devices = setup_seed_reproducibility(cfg.train.seed, cfg.train.cuda_deterministic)
 
@@ -236,7 +229,7 @@ def finetune_binary_main(cfg: Cfig):
         total_epochs=[cfg.train.epochs],
         steps_per_epoch=len(finetune_loader["train"]),
         init_lr=[cfg.train.lr],
-        max_lr=[1e-03],
+        max_lr=[5e-04],
         final_lr=[1e-05]
     )
 
@@ -270,9 +263,6 @@ def finetune_regression_main(cfg: Cfig):
     ensure_dir_exists(cfg.logger.log_dir)
 
     initialize_logger(cfg.logger.log_dir)
-
-    # copy the config file to the log directory
-    shutil.copy('configs/finetune_regression.yaml', os.path.join(cfg.logger.log_dir, "finetune_regression.yaml"))
 
     # Initialize the random seed and device configuration for reproducibility
     devices = setup_seed_reproducibility(cfg.train.seed, cfg.train.cuda_deterministic)
@@ -352,9 +342,6 @@ def inference_binary_main(cfg: Cfig):
 
     initialize_logger(cfg.logger.log_dir)
 
-    # copy the config file to the log directory
-    shutil.copy('configs/inference_binary.yaml', os.path.join(cfg.logger.log_dir, "inference_binary.yaml"))
-
     # Initialize the random seed and device configuration for reproducibility
     devices = setup_seed_reproducibility(cfg.train.seed, cfg.train.cuda_deterministic)
 
@@ -405,19 +392,21 @@ def ensure_dir_exists(path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AmpHGT')
     parser.add_argument('mode', type=str, default='pt', help='Mode to run the program in: pt, ftb, ftr, ifb, fe, fa')
+    parser.add_argument('-c', '--config', type=str, help='Path to custom config file')
+    parser.add_argument('-o', '--output_dir', type=str, help='Override output directory')
     args = parser.parse_args()
 
     if args.mode == 'pt':
-        pretrain_main()
+        pretrain_main(config_path=args.config, output_dir=args.output_dir)
     elif args.mode == 'ftb':
-        finetune_binary_main()
+        finetune_binary_main(config_path=args.config, output_dir=args.output_dir)
     elif args.mode == 'ftr':
-        finetune_regression_main()
+        finetune_regression_main(config_path=args.config, output_dir=args.output_dir)
     elif args.mode == 'ifb':
-        inference_binary_main()
+        inference_binary_main(config_path=args.config, output_dir=args.output_dir)
     elif args.mode == 'fe':
-        extract_embeddings_encoder_main()
+        extract_embeddings_encoder_main(config_path=args.config, output_dir=args.output_dir)
     elif args.mode == 'fa':
-        extract_embeddings_amphgt_main()
+        extract_embeddings_amphgt_main(config_path=args.config, output_dir=args.output_dir)
     else:
         raise ValueError(f"Invalid mode: {args.mode}")

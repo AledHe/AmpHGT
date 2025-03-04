@@ -42,28 +42,43 @@ def initialize_logger(log_file_path):
 def debug(msg, *args, st=0, **kwargs):
     if st > 0:
         time.sleep(st)
-    logger.debug(msg, *args, stacklevel=2, **kwargs)
+    if args:
+        logger.debug("%s %s", msg, " ".join(map(str, args)), stacklevel=2, **kwargs)
+    else:
+        logger.debug(msg, stacklevel=2, **kwargs)
 
 def info(msg, *args, st=0, **kwargs):
     if st > 0:
         time.sleep(st)
-    logger.info(msg, *args, stacklevel=2, **kwargs)
+    if args:
+        logger.info("%s %s", msg, " ".join(map(str, args)), stacklevel=2, **kwargs)
+    else:
+        logger.info(msg, stacklevel=2, **kwargs)
 
 def warning(msg, *args, st=0, **kwargs):
     if st > 0:
         time.sleep(st)
-    logger.warning(msg, *args, stacklevel=2, **kwargs)
+    if args:
+        logger.warning("%s %s", msg, " ".join(map(str, args)), stacklevel=2, **kwargs)
+    else:
+        logger.warning(msg, stacklevel=2, **kwargs)
 
 def error(msg, *args, st=0, **kwargs):
     if st > 0:
         time.sleep(st)
-    logger.error(msg, *args, stacklevel=2, **kwargs)
+    if args:
+        logger.error("%s %s", msg, " ".join(map(str, args)), stacklevel=2, **kwargs)
+    else:
+        logger.error(msg, stacklevel=2, **kwargs)
     raise Exception(msg)
 
 def critical(msg, *args, st=0, **kwargs):
     if st > 0:
         time.sleep(st)
-    logger.critical(msg, *args, stacklevel=2, **kwargs)
+    if args:
+        logger.critical("%s %s", msg, " ".join(map(str, args)), stacklevel=2, **kwargs)
+    else:
+        logger.critical(msg, stacklevel=2, **kwargs)
     raise Exception(msg)
 
 def set_log_level(level):

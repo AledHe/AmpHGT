@@ -33,6 +33,54 @@ class PositionEmbedding(nn.Module):
         pos_emb = self.pos_embedding(positions)  # [1, seq_len, embed_dim]
         return x + pos_emb # [batch_size, seq_len, embed_dim]
     
+class MultiScaleConv(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_sizes: list,
+        dropout: float = 0.1,
+        activation: nn.Module = nn.ReLU(),
+    ):
+        super().__init__()
+        self.branches = nn.ModuleList()
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout)
+        self.shortcut = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+
+        for k in kernel_sizes:
+            branch = nn.Sequential(
+                nn.Conv1d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=k,
+                    padding=k // 2,
+                    bias=False
+                ),
+                nn.BatchNorm1d(out_channels),
+                self.activation,
+                self.dropout
+            )
+            self.branches.append(branch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.shortcut(x.transpose(1, 2)).transpose(1, 2)  # [B, L, C]
+
+        # multi cov
+        branch_outputs = []
+        for branch in self.branches:
+            # x: [B, L, C_in]
+            x_conv = x.transpose(1, 2)  # [B, C_in, L]
+            out = branch(x_conv)        # [B, C_out, L]
+            out = out.transpose(1, 2)   # [B, L, C_out]
+            branch_outputs.append(out)
+
+        # stack the outputs
+        merged = torch.stack(branch_outputs, dim=0).sum(dim=0)  # [B, L, C_out]
+
+        output = self.activation(merged + residual)
+        return output
+    
 class ConvTransformerEncoder(nn.Module):
     """
     1D Conv + Transformer Encoder adapted for graph node features
@@ -60,11 +108,10 @@ class ConvTransformerEncoder(nn.Module):
         super().__init__()
         
         # 1D Convolution
-        self.conv1d = nn.Sequential(
-            nn.Conv1d(embed_dim, conv_channels, kernel_size, padding=kernel_size//2),
-            nn.ReLU(),
-            nn.BatchNorm1d(conv_channels),
-            nn.Dropout(dropout)
+        self.conv1d = MultiScaleConv(
+            in_channels=embed_dim,
+            out_channels=conv_channels,
+            kernel_sizes=kernel_size
         )
         
         # Transformer encoder
@@ -79,20 +126,18 @@ class ConvTransformerEncoder(nn.Module):
             encoder_layer,
             num_layers=num_layers
         )
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, key_padding_mask=None):
         """
         x: [batch_size, seq_len, embed_dim]
         mask: [batch_size, seq_len, seq_len], 1 -> include, 0 -> exclude
         """
-        # Dropout
-        x = self.dropout(x) # [batch_size, seq_len, embed_dim]
+        residual = x
 
         # Convolution over embedding dimension
-        x = x.transpose(1, 2)  # [batch_size, embed_dim, seq_len]
         x = self.conv1d(x)     # [batch_size, conv_channels, seq_len]
-        x = x.transpose(1, 2)  # [batch_size, seq_len, conv_channels]
+
+        x = x + residual
 
         out = self.transformer_encoder(
             x,
@@ -109,11 +154,11 @@ class ResidueEncoder(nn.Module):
         max_len=101,
         token2id=None,
         conv_channels=256,
-        kernel_size=5,
+        kernel_size=[1, 3, 5],
         num_heads=4,
         num_layers=2,
         ff_dim=1024,
-        dropout=0.1
+        dropout=0.4
         ):
         super().__init__()
         if token2id:

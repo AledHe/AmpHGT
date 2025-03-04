@@ -55,7 +55,10 @@ class Finetune_Trainer(object):
     def train_epoch(self):
         self.model.train()
 
-        metrics_tracker = defaultdict(float)
+        epoch_metrics = defaultdict(float)
+        interval_metrics = defaultdict(float)
+        interval_samples = 0
+
         num_batches = 0
 
         for step, (batch, label) in enumerate(self.dataloaders['train']):
@@ -79,16 +82,21 @@ class Finetune_Trainer(object):
             self.optimizer.step()
             self.scheduler.step()
 
-            metrics_tracker['loss'] += loss.item()
+            epoch_metrics['loss'] += loss.item()
+            interval_metrics['loss'] += loss.item()
             num_batches += 1
+            interval_samples += 1
 
             # Log progress
             self.global_train_step += 1
             if self.global_train_step % self.monitor_steps == 0:
-                avg_loss = metrics_tracker['loss']/num_batches
+                avg_loss = interval_metrics['loss']/num_batches
                 self._log_progress({'loss': avg_loss}, step, "train")
 
-        return {k: v/num_batches for k, v in metrics_tracker.items()}
+                interval_metrics.clear()
+                interval_samples = 0
+
+        return {k: v/num_batches for k, v in epoch_metrics.items()}
     
     def eov_epoch(self, stage: str):
         """evaluation or validation epoch"""

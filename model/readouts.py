@@ -216,30 +216,39 @@ class HierAttnReadout(nn.Module):
         return self.cross_proj(unified_embed)
     
 class SemanticAttentionReadout(nn.Module):
-    def __init__(self, hid_dim, attn_heads=4):
+    def __init__(self, hid_dim, attn_heads=1):
         super().__init__()
         self.hid_dim = hid_dim
+        self.attn_heads = attn_heads
 
         # 1. 分类型注意力池化（Step 1）
         self.type_attn = nn.ModuleDict({
-            'a': MultiHeadedAttention(h=attn_heads, d_model=hid_dim),
-            'p': MultiHeadedAttention(h=attn_heads, d_model=hid_dim),
-            'rsd': MultiHeadedAttention(h=attn_heads, d_model=hid_dim),
+            'a': nn.Sequential(
+                nn.Linear(hid_dim, hid_dim),
+                nn.Tanh(),
+                nn.Linear(hid_dim, 1, bias=False)
+            ),
+            'p': nn.Sequential(
+                nn.Linear(hid_dim, hid_dim),
+                nn.Tanh(),
+                nn.Linear(hid_dim, 1, bias=False)
+            ),
+            'rsd': nn.Sequential(
+                nn.Linear(hid_dim, hid_dim),
+                nn.Tanh(),
+                nn.Linear(hid_dim, 1, bias=False)
+            )
         })
 
         # 2. 类型间注意力（Step 2）
-        self.semantic_attn = nn.Sequential(
-            nn.Linear(hid_dim, hid_dim),
-            nn.Tanh(),
-            nn.Linear(hid_dim, 1, bias=False)
-        )
+        self.semantic_attn = MultiHeadedAttention(h=attn_heads, d_model=hid_dim)
+        self.semantic_proj = nn.Linear(hid_dim, 1, bias=False)
 
         # 初始化参数
         for attn in self.type_attn.values():
             nn.init.xavier_normal_(attn[0].weight)
             nn.init.xavier_normal_(attn[2].weight)
-        nn.init.xavier_normal_(self.semantic_attn[0].weight)
-        nn.init.xavier_normal_(self.semantic_attn[2].weight)
+        nn.init.xavier_normal_(self.semantic_proj.weight)
 
     def get_batch_indices(self, bg, ntype):
         """生成每个节点对应的图索引（batch内第几个图）"""
@@ -269,21 +278,25 @@ class SemanticAttentionReadout(nn.Module):
         return pooled  # [batch_size, hid_dim]
 
     def forward(self, bg):
-        # Step 1: 分别池化三种节点类型
         a_pool = self.type_wise_pool(bg, 'a')  # [B, D]
-        p_pool = self.type_wise_pool(bg, 'p')  # [B, D]
-        rsd_pool = self.type_wise_pool(bg, 'rsd')  # [B, D]
-
-        # Step 2: 对三种池化结果做语义级注意力
-        pooled_list = [a_pool, p_pool, rsd_pool]
-        pooled_matrix = torch.stack(pooled_list, dim=1)  # [B, 3, D]
-
-        # 计算语义级注意力得分
-        attn_scores = self.semantic_attn(pooled_matrix)  # [B, 3, 1]
-        attn_scores = F.softmax(attn_scores, dim=1)      # [B, 3, 1]
-
+        p_pool = self.type_wise_pool(bg, 'p')
+        rsd_pool = self.type_wise_pool(bg, 'rsd')
+        
+        pooled_matrix = torch.stack([a_pool, p_pool, rsd_pool], dim=1)  # [B, 3, D]
+        
+        # 多头注意力交互
+        attn_output = self.semantic_attn(
+            pooled_matrix, pooled_matrix, pooled_matrix
+        )  # [B, 3, D]
+        
+        # 计算各类型的权重
+        weights = F.softmax(
+            self.semantic_proj(attn_output).squeeze(-1),  # [B, 3]
+            dim=-1
+        )  # [B, 3]
+        
         # 加权求和
-        graph_emb = (pooled_matrix * attn_scores).sum(dim=1)  # [B, D]
+        graph_emb = (attn_output * weights.unsqueeze(-1)).sum(dim=1)  # [B, D]
         return graph_emb
 
 class GRUReadout(nn.Module):

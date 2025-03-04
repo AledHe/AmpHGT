@@ -352,6 +352,8 @@ class PharmHGT_FP(nn.Module):
             self.readout = HierAttnReadout(hid_dim)
         elif self.cfg.train.readout == 'gru':
             self.readout = GRUReadout(hid_dim)
+        elif self.cfg.train.readout == 'att':
+            self.readout = HierAttnReadout(hid_dim)
         elif self.cfg.train.readout == 'sar':
             self.readout = SemanticAttentionReadout(hid_dim)
         elif self.cfg.train.readout == 'none':
@@ -374,6 +376,8 @@ class PharmHGT_FP(nn.Module):
             self.fusion = GatedFusion(embed_dim=hid_dim)
         elif self.cfg.train.fusion == 'bilinear':
             self.fusion = BilinearFusion(embed_dim=hid_dim)
+        elif self.cfg.train.fusion == 'attention':
+            self.fusion = CrossAttentionFusion(d_model=hid_dim, num_heads=4)
         else:
             raise ValueError(f"Invalid pooling method: {self.cfg.train.fusion}")
             
@@ -437,7 +441,7 @@ class PharmHGT_FP(nn.Module):
     
     def forward(self, bg):
         # embedding extraction
-        if self.load_pretrained:
+        if self.load_pretrained and not self.cfg.train.full_ft:
             # do not mess up the pretrained model
             with torch.no_grad():
                 bg, cls_emb = self.pretrain_model(bg, finetune=True) # cls_emb: (batch_size, conv_channels), conv_channels = hid_dim
@@ -489,13 +493,37 @@ class BilinearFusion(nn.Module):
         fused = self.linear(fused)
         return fused
     
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super(CrossAttentionFusion, self).__init__()
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=d_model, 
+                                                   num_heads=num_heads, 
+                                                   batch_first=True)
+    def forward(self, feat_gnn, feat_tfm):
+        # feat_gnn, feat_tfm 形状都是 (B, D)
+        # 先拓展成 seq_len=1 的形式 (B, 1, D)
+        feat_gnn = feat_gnn.unsqueeze(1) 
+        feat_tfm = feat_tfm.unsqueeze(1)
+        
+        # 使用 GNN 特征作为 query，Transformer 特征作为 key & value
+        fusion, _ = self.multihead_attn(query=feat_gnn, 
+                                        key=feat_tfm, 
+                                        value=feat_tfm)
+        # fusion: (B, 1, D)
+        fusion = fusion.squeeze(1)
+        return fusion
+    
 class MLP(nn.Module):
     """feed bg_embeds to MLP and give binary classification, note that num_classes=1"""
     def __init__(self, hid_dim, num_classes, input_dim):
         super(MLP,self).__init__()
         self.mlp = nn.Sequential(
+            nn.Dropout(p=0.5),
             nn.Linear(input_dim, hid_dim),
             nn.BatchNorm1d(hid_dim),
+            nn.ReLU(),
+            nn.Dropout(p=0.5),
+            nn.Linear(hid_dim, hid_dim),
             nn.ReLU(),
             nn.Linear(hid_dim, hid_dim // 2),
             nn.ReLU(),

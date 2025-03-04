@@ -73,6 +73,15 @@ class Cfig(MutableMapping):
     
     def values(self):
         return self._store.values()
+    
+    def to_dict(self):
+        result = {}
+        for k, v in self._store.items():
+            if isinstance(v, Cfig):
+                result[k] = v.to_dict()
+            else:
+                result[k] = v
+        return result
 
 def load_params(file_path, output_dir):
     """
@@ -96,7 +105,31 @@ def lcfig(config_path, output_dir):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            params = load_params(config_path, output_dir)
+            # 从 kwargs 提取覆盖参数
+            dynamic_config = kwargs.pop('config_path', None)
+            dynamic_output = kwargs.pop('output_dir', None)
+            
+            # 确定最终使用的路径
+            final_config_path = dynamic_config or config_path
+            final_output_dir = dynamic_output or output_dir
+            
+            # 加载配置
+            params = load_params(final_config_path, final_output_dir)
+            
+            # 构建保存路径
+            log_dir = params.logger.log_dir
+            os.makedirs(log_dir, exist_ok=True)
+            
+            # 生成带 _final 后缀的 config 文件名
+            original_filename = os.path.basename(final_config_path)  # 如 pretrain.yaml
+            name_part, ext_part = os.path.splitext(original_filename)  # (pretrain, .yaml)
+            final_config_name = f"{name_part}{ext_part}"  # pretrain.yaml
+            final_save_path = os.path.join(log_dir, final_config_name)
+            
+            # 保存（确保不覆盖原文件）
+            with open(final_save_path, 'w') as f:
+                yaml.dump(params.to_dict(), f)
+            
             return func(params, *args, **kwargs)
         return wrapper
     return decorator

@@ -1,8 +1,18 @@
 # read_params.py
 
+# ===============================================================================
+# Copyright (C) 2025 by Yongcheng He
+# Center for Sustainable Antimicrobials, Department of Pharmacy, College of Veterinary Medicine
+# Sichuan Agricultural University, Chengdu
+
+# Licensed under the MIT License.
+# See LICENSE file in the project root for full license information.
+# ===============================================================================
+
 import yaml
 import os
 import re
+import ast
 from functools import wraps
 from datetime import datetime
 from collections.abc import MutableMapping
@@ -105,34 +115,78 @@ def lcfig(config_path, output_dir):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            # 从 kwargs 提取覆盖参数
+
             dynamic_config = kwargs.pop('config_path', None)
             dynamic_output = kwargs.pop('output_dir', None)
-            
-            # 确定最终使用的路径
+            dynamic_unknown_args = kwargs.pop('unk_args', [])
+
             final_config_path = dynamic_config or config_path
             final_output_dir = dynamic_output or output_dir
+            if not final_config_path:
+                raise ValueError("No config_path provided or set in decorator.")
             
-            # 加载配置
-            params = load_params(final_config_path, final_output_dir)
-            
-            # 构建保存路径
+            params = load_params(final_config_path, final_output_dir or "logs")
+            # print(dynamic_unknown_args)
+            overrides = parse_overrides(dynamic_unknown_args)
+            if overrides:
+                print("[lcfig] Detected overrides:", overrides)
+                apply_overrides_to_cfig(params, overrides)
+
             log_dir = params.logger.log_dir
             os.makedirs(log_dir, exist_ok=True)
-            
-            # 生成带 _final 后缀的 config 文件名
-            original_filename = os.path.basename(final_config_path)  # 如 pretrain.yaml
-            name_part, ext_part = os.path.splitext(original_filename)  # (pretrain, .yaml)
-            final_config_name = f"{name_part}{ext_part}"  # pretrain.yaml
+            original_filename = os.path.basename(final_config_path)
+            name_part, ext_part = os.path.splitext(original_filename)
+            final_config_name = f"{name_part}{ext_part}"  # 如 pretrain.yaml
             final_save_path = os.path.join(log_dir, final_config_name)
-            
-            # 保存（确保不覆盖原文件）
             with open(final_save_path, 'w') as f:
                 yaml.dump(params.to_dict(), f)
             
             return func(params, *args, **kwargs)
         return wrapper
     return decorator
+
+def parse_value_as_python(value: str):
+    """parse str to bool, int, float, list"""
+    try:
+        return ast.literal_eval(value)
+    except (SyntaxError, ValueError):
+        return value
+    
+def parse_overrides(unknown_args):
+    """
+    parse unk args to {key: value}
+    ["-train*log_interval", "10", "-train*mask_edge", "True"]
+    -> {"train.log_interval": 10, "train.mask_edge": True}
+    """
+    overrides = {}
+    i = 0
+    while i < len(unknown_args):
+        arg = unknown_args[i]
+        if arg.startswith('-'):
+            key = arg[1:].replace("*", ".")
+            if i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith('-'):
+                value = parse_value_as_python(unknown_args[i + 1])
+                i += 2
+            else:
+                value = True
+                i += 1
+            overrides[key] = value
+        else:
+            i += 1
+    return overrides
+
+def apply_overrides_to_cfig(cfg: Cfig, overrides: dict):
+    for full_key, value in overrides.items():
+        parts = full_key.split('.')
+        d = cfg
+        for p in parts[:-1]:
+            if p not in d:
+                raise KeyError(f"Key '{p}' (in '{full_key}') not found in config.")
+            d = d[p]
+        last = parts[-1]
+        if last not in d:
+            raise KeyError(f"Key '{full_key}' not found in config.")
+        d[last] = value
 
 if __name__ == '__main__':
     base_path = os.path.dirname(os.path.abspath(__file__))

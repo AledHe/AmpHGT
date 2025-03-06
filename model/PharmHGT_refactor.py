@@ -6,7 +6,8 @@ from functools import partial
 from model.utils import get_func
 from utils.std_logger import error, info
 from .readouts import GlobalPooling, HierAttnReadout, SemanticAttentionReadout, MultiHeadedAttention, GRUReadout
-from model.sequence_embedding import VOCAB_SIZE, ResidueEncoder
+from .sequence_embedding import VOCAB_SIZE, ResidueEncoder
+from .ESM2 import ESMResidueEncoder
 
 # dgl graph utils
 def reverse_edge(tensor):
@@ -87,10 +88,10 @@ class MVMP(nn.Module):
         for ntype in self.node_types:
             self.node_last_layer[ntype] = nn.Linear(3*hid_dim,hid_dim)
 
-        self.nodefusion = nn.ModuleDict({
-            ntype: NodeFusion(hid_dim) 
-            for ntype in ['a', 'p', 'rsd']
-        })
+        # self.nodefusion = nn.ModuleDict({
+        #     ntype: NodeFusion(hid_dim) 
+        #     for ntype in ['a', 'p', 'rsd']
+        # })
 
     def update_edge(self,edge,layer):
         return {'h':self.act(edge.data['x']+layer(edge.data['m']))}
@@ -211,21 +212,21 @@ class MVMP(nn.Module):
         bg.multi_update_all(final_update_funcs, cross_reducer='sum')
         
         # aftert the last message passing, fusion feature.
-        for ntype in ['a', 'p', 'rsd']:
-            if bg.num_nodes(ntype) == 0:
-                continue
+        # for ntype in ['a', 'p', 'rsd']:
+        #     if bg.num_nodes(ntype) == 0:
+        #         continue
 
-            feat_main = bg.nodes[ntype].data.get(f'f_{self.suffix}')
-            feat_junc = bg.nodes[ntype].data.get(f'f_junc_{self.suffix}')
+        #     feat_main = bg.nodes[ntype].data.get(f'f_{self.suffix}')
+        #     feat_junc = bg.nodes[ntype].data.get(f'f_junc_{self.suffix}')
 
-            if feat_main is None or feat_junc is None:
-                error("feat_main is None or feat_junc is None")
+        #     if feat_main is None or feat_junc is None:
+        #         error("feat_main is None or feat_junc is None")
             
-            fused_feat = self.nodefusion[ntype](feat_main, feat_junc)
-            bg.nodes[ntype].data['f_final'] = fused_feat # (N, hid_dim)
+        #     fused_feat = self.nodefusion[ntype](feat_main, feat_junc)
+        #     bg.nodes[ntype].data['f_final'] = fused_feat # (N, hid_dim)
         
 class PharmHGT(nn.Module):
-    def __init__(self, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, device):
+    def __init__(self, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, device, sq_embed):
         super(PharmHGT,self).__init__()
         # hid_dim = args['hid_dim']
         self.act = get_func(act)
@@ -241,7 +242,25 @@ class PharmHGT(nn.Module):
         # junction view
         self.w_junc = nn.Linear(atom_dim + pharm_dim, hid_dim)
 
+        if sq_embed == "CovTrans":
+            self.rsd_encoder = ResidueEncoder(
+                vocab_size=VOCAB_SIZE,
+                embed_dim=hid_dim,
+                conv_channels=hid_dim,
+                ff_dim=hid_dim * 4,
+            ).to(device=device)
+        elif sq_embed == "ESM2":
+            self.rsd_encoder = ESMResidueEncoder()
+            self.rsd_dim = ESMResidueEncoder().hidden_dim
+
         # residue view
+        if self.rsd_dim:
+            self.w_rsd_proj = nn.Sequential(
+                nn.Linear(self.rsd_dim, hid_dim * 2),
+                nn.ReLU(),
+                nn.Linear(hid_dim * 2, hid_dim),
+                nn.ReLU(),
+            )
         self.w_rsd_junc = nn.Linear(hid_dim, hid_dim)
         self.w_rsd_edge = nn.Linear(1, hid_dim)
 
@@ -251,13 +270,6 @@ class PharmHGT(nn.Module):
         # so there might no need to run 'a', 'ap' in advance.
         self.mp = MVMP(msg_func=add_attn, hid_dim=hid_dim, depth=self.depth, view='apjr', suffix='h', act=self.act)
         # self.mp_junc = MVMP(msg_func=add_attn,hid_dim=hid_dim,depth=self.depth,view='apj',suffix='j',act=self.act)
-
-        self.rsd_encoder = ResidueEncoder(
-            vocab_size=VOCAB_SIZE,
-            embed_dim=hid_dim,
-            conv_channels=hid_dim,
-            ff_dim=hid_dim * 4,
-        ).to(device=device)
 
         self.initialize_weights()
 
@@ -275,6 +287,7 @@ class PharmHGT(nn.Module):
         
         bg.nodes['a'].data['f'] = self.act(self.w_atom(bg.nodes['a'].data['f']))
         bg.edges[('a','b','a')].data['x'] = self.act(self.w_bond(bg.edges[('a','b','a')].data['x']))
+        
         bg.nodes['p'].data['f'] = self.act(self.w_pharm(bg.nodes['p'].data['f']))
         if bg.edges[('p','r','p')].data['x'].numel():
             bg.edges[('p','r','p')].data['x'] = self.act(self.w_reac(bg.edges[('p','r','p')].data['x']))
@@ -286,6 +299,7 @@ class PharmHGT(nn.Module):
         # make sure the edge feature projects to the proper dimension.
         if bg.edges[('rsd','s','rsd')].data['x'].size(1) == 1:
             bg.edges[('rsd','s','rsd')].data['x'] = self.act(self.w_rsd_edge(bg.edges[('rsd','s','rsd')].data['x']))
+
         # init the rsd_junc here.
         if 'f_junc' not in bg.nodes['rsd'].data:
             dim_rsd = bg.nodes['rsd'].data['f'].size(1)
@@ -309,6 +323,11 @@ class PharmHGT(nn.Module):
             bg: a batch of graphs
         """
         rsd_emb, cls_emb = self.rsd_encoder(bg) # (num_nodes, conv_channels), (batch_size, conv_channels)
+
+        # for esm, we need to project hidden_dim.
+        if self.w_rsd_proj:
+            rsd_emb = self.w_rsd_proj(rsd_emb)  # => [total_num_rsd, hid_dim]
+
         bg.nodes['rsd'].data['f'] = rsd_emb # apply new added residue nodes feature by sequence encoder.
 
         self.init_feature(bg)
@@ -324,9 +343,9 @@ class PharmHGT(nn.Module):
         Baseline for pretrain.
         Extract embeddings directly from bg and do a simple cat.
         """
-        embed_f_a = bg.nodes['a'].data['f_final']
-        embed_f_p = bg.nodes['p'].data['f_final']
-        embed_f_rsd = bg.nodes['rsd'].data['f_final']
+        embed_f_a = bg.nodes['a'].data['f_h']
+        embed_f_p = bg.nodes['p'].data['f_h']
+        embed_f_rsd = bg.nodes['rsd'].data['f_h']
         # embed_f_a, embed_f_p, embed_f_rsd: (N, hid_dim), N is the number of nodes in the graph.
         # torch.Size([1530, 512]) torch.Size([384, 512]) torch.Size([179, 512])
         
@@ -336,7 +355,7 @@ class PharmHGT_FP(nn.Module):
     """
     PharmHGT pretrained pooling. FP: From Pretrained.
     """
-    def __init__(self, cfg, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, device, load_pretrained):
+    def __init__(self, cfg, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, device, sq_embed, load_pretrained):
         super(PharmHGT_FP,self).__init__()
         self.cfg = cfg
         self.act = get_func(act)
@@ -352,8 +371,6 @@ class PharmHGT_FP(nn.Module):
             self.readout = HierAttnReadout(hid_dim)
         elif self.cfg.train.readout == 'gru':
             self.readout = GRUReadout(hid_dim)
-        elif self.cfg.train.readout == 'att':
-            self.readout = HierAttnReadout(hid_dim)
         elif self.cfg.train.readout == 'sar':
             self.readout = SemanticAttentionReadout(hid_dim)
         elif self.cfg.train.readout == 'none':
@@ -392,7 +409,8 @@ class PharmHGT_FP(nn.Module):
             bond_dim=self.bond_dim,
             pharm_dim=self.pharm_dim,
             reac_dim=self.reac_dim,
-            device=device
+            device=device,
+            sq_embed=sq_embed
         )
 
     def load_model(
@@ -405,7 +423,8 @@ class PharmHGT_FP(nn.Module):
             bond_dim: int,
             pharm_dim: int,
             reac_dim: int,
-            device: torch.device
+            device: torch.device,
+            sq_embed: str
         ):
         model = PharmHGT(
             hid_dim=hid_dim,
@@ -415,7 +434,8 @@ class PharmHGT_FP(nn.Module):
             bond_dim=bond_dim,
             pharm_dim=pharm_dim,
             reac_dim=reac_dim,
-            device=device
+            device=device,
+            sq_embed = sq_embed
         ).to(device)
 
         if not self.load_pretrained:
@@ -456,6 +476,8 @@ class PharmHGT_FP(nn.Module):
 
         fused_feats = self.fusion(bg_embeds, cls_emb)  # (batch_size, hid_dim)
 
+        # cat_feats = torch.cat([bg_embeds, cls_emb], dim=-1)
+
         # info("bg_embeds均值:", bg_embeds.mean().item())
         # info("cls_emb均值:", cls_emb.mean().item())
         # info("融合后特征均值:", fused_feats.mean().item(), st=5)
@@ -465,6 +487,8 @@ class PharmHGT_FP(nn.Module):
 
         return logits # shape [B, 1] for binary classification
     
+# bilinear is the better option.
+
 class GatedFusion(nn.Module):
     def __init__(self, embed_dim):
         super(GatedFusion, self).__init__()
@@ -518,11 +542,10 @@ class MLP(nn.Module):
     def __init__(self, hid_dim, num_classes, input_dim):
         super(MLP,self).__init__()
         self.mlp = nn.Sequential(
-            nn.Dropout(p=0.5),
+            nn.Dropout(p=0.4),
             nn.Linear(input_dim, hid_dim),
             nn.BatchNorm1d(hid_dim),
             nn.ReLU(),
-            nn.Dropout(p=0.5),
             nn.Linear(hid_dim, hid_dim),
             nn.ReLU(),
             nn.Linear(hid_dim, hid_dim // 2),

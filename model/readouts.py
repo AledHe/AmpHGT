@@ -141,7 +141,7 @@ class GlobalPooling(nn.Module):
             error(f'Invalid pooling mode: {self.mode}')
         return pooled
     
-    def forward(self, bg: dgl.DGLHeteroGraph, suffix='final'):
+    def forward(self, bg: dgl.DGLHeteroGraph, suffix='h'):
         feat_name = f'f_{suffix}'
 
         a_embed = self.batch_pool(bg, 'a', feat_name)  # (B, D)
@@ -191,7 +191,7 @@ class HierAttnReadout(nn.Module):
         weighted_feats = feats * norm_weights
         return scatter(weighted_feats, batch_ids, dim=0, reduce='sum')  # [batch_size, hid_dim]
 
-    def forward(self, bg, suffix='final'):
+    def forward(self, bg, suffix='h'):
         # define processing order and corresponding attention layers
         node_types = ['a', 'p', 'rsd']
         attn_modules = [self.a_attn, self.p_attn, self.rsd_attn]
@@ -264,7 +264,7 @@ class SemanticAttentionReadout(nn.Module):
             # 若该类型无节点，返回全零向量
             return torch.zeros(bg.batch_size, self.hid_dim, device=bg.device)
         
-        feats = bg.nodes[ntype].data['f_final']  # [num_nodes, hid_dim]
+        feats = bg.nodes[ntype].data['f_h']  # [num_nodes, hid_dim]
         batch_indices = self.get_batch_indices(bg, ntype)  # [num_nodes]
 
         # 计算注意力得分（带非线性）
@@ -354,7 +354,7 @@ class GRUReadout(nn.Module):
         )
         return query_pad + attended
 
-    def forward(self, bg, suffix='final'):
+    def forward(self, bg, suffix='h'):
         device = bg.device
 
         # feature padding

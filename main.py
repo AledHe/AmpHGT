@@ -122,7 +122,8 @@ def pretrain_main(cfg: Cfig):
         cfg.train.bond_dim,
         cfg.train.pharm_dim, 
         cfg.train.reac_dim,
-        devices
+        devices,
+        cfg.train.sq_embed
     ).to(devices)
 
     ### New head added 24.10.24
@@ -214,6 +215,7 @@ def finetune_binary_main(cfg: Cfig):
         cfg.train.pharm_dim, 
         cfg.train.reac_dim,
         devices,
+        cfg.train.sq_embed,
         cfg.train.load_pretrained
     ).to(devices)
     
@@ -229,7 +231,7 @@ def finetune_binary_main(cfg: Cfig):
         total_epochs=[cfg.train.epochs],
         steps_per_epoch=len(finetune_loader["train"]),
         init_lr=[cfg.train.lr],
-        max_lr=[5e-04],
+        max_lr=[1e-03],
         final_lr=[1e-05]
     )
 
@@ -292,6 +294,7 @@ def finetune_regression_main(cfg: Cfig):
         cfg.train.pharm_dim, 
         cfg.train.reac_dim,
         devices,
+        cfg.train.sq_embed,
         cfg.train.load_pretrained
     ).to(devices)
 
@@ -360,7 +363,8 @@ def inference_binary_main(cfg: Cfig):
     model = AmpHGT_FT.from_checkpoint(
         checkpoint_path=cfg.train.checkpoint_path,
         cfg=cfg,
-        device=devices
+        device=devices,
+        sq_embed=cfg.train.sq_embed
     ).to(devices)
 
     inferencer = Inferencer_Binary(
@@ -394,19 +398,19 @@ if __name__ == '__main__':
     parser.add_argument('mode', type=str, default='pt', help='Mode to run the program in: pt, ftb, ftr, ifb, fe, fa')
     parser.add_argument('-c', '--config', type=str, help='Path to custom config file')
     parser.add_argument('-o', '--output_dir', type=str, help='Override output directory')
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
 
     if args.mode == 'pt':
-        pretrain_main(config_path=args.config, output_dir=args.output_dir)
+        pretrain_main(config_path=args.config, output_dir=args.output_dir, unk_args=unknown_args)
     elif args.mode == 'ftb':
-        finetune_binary_main(config_path=args.config, output_dir=args.output_dir)
+        finetune_binary_main(config_path=args.config, output_dir=args.output_dir, unk_args=unknown_args)
     elif args.mode == 'ftr':
-        finetune_regression_main(config_path=args.config, output_dir=args.output_dir)
+        finetune_regression_main(config_path=args.config, output_dir=args.output_dir, unk_args=unknown_args)
     elif args.mode == 'ifb':
-        inference_binary_main(config_path=args.config, output_dir=args.output_dir)
+        inference_binary_main(config_path=args.config, output_dir=args.output_dir, unk_args=unknown_args)
     elif args.mode == 'fe':
-        extract_embeddings_encoder_main(config_path=args.config, output_dir=args.output_dir)
+        extract_embeddings_encoder_main(config_path=args.config, output_dir=args.output_dir, unk_args=unknown_args)
     elif args.mode == 'fa':
-        extract_embeddings_amphgt_main(config_path=args.config, output_dir=args.output_dir)
+        extract_embeddings_amphgt_main(config_path=args.config, output_dir=args.output_dir, unk_args=unknown_args)
     else:
         raise ValueError(f"Invalid mode: {args.mode}")

@@ -112,9 +112,9 @@ class HeteroConv(nn.Module):
         """
         # 1) Heterogeneous Convolution
         h = {
-            'a': bg.nodes['a'].data['f_final'],
-            'p': bg.nodes['p'].data['f_final'],
-            'rsd': bg.nodes['rsd'].data['f_final']
+            'a': bg.nodes['a'].data['f_h'],
+            'p': bg.nodes['p'].data['f_h'],
+            'rsd': bg.nodes['rsd'].data['f_h']
         }
 
         for i in range(self.num_layers):
@@ -191,9 +191,9 @@ class HeteroAttNet(nn.Module):
 
     def forward(self, bg):
         h = {
-            'a': bg.nodes['a'].data['f_final'],
-            'p': bg.nodes['p'].data['f_final'],
-            'rsd': bg.nodes['rsd'].data['f_final']
+            'a': bg.nodes['a'].data['f_h'],
+            'p': bg.nodes['p'].data['f_h'],
+            'rsd': bg.nodes['rsd'].data['f_h']
         }
 
         for i in range(self.num_layers):

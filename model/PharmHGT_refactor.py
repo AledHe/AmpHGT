@@ -328,7 +328,7 @@ class PharmHGT(nn.Module):
         rsd_emb, cls_emb = self.rsd_encoder(bg) # (num_nodes, conv_channels), (batch_size, conv_channels)
 
         # for esm, we need to project hidden_dim.
-        if self.w_rsd_proj:
+        if hasattr(self, 'w_rsd_proj'):
             rsd_emb = self.w_rsd_proj(rsd_emb)  # => [total_num_rsd, hid_dim]
 
         bg.nodes['rsd'].data['f'] = rsd_emb # apply new added residue nodes feature by sequence encoder.

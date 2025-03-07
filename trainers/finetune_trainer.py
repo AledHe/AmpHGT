@@ -158,10 +158,8 @@ class Finetune_Trainer(object):
                 break
 
             val_metrics = self.eov_epoch("valid")
-            intrain_test_metrics = self.eov_epoch(stage='test')
 
             self._log_epoch_metrics(train_metrics=None, val_metrics=val_metrics, test_metrics=None, epoch=epoch)
-            self._log_epoch_metrics(train_metrics=None, val_metrics=None, test_metrics=intrain_test_metrics, epoch=epoch)
 
             # Model selection and early stopping
             if val_metrics['mcc'] > self.best_mcc:
@@ -173,6 +171,10 @@ class Finetune_Trainer(object):
                 if self.patience_counter >= self.cfg.train.patience:
                     info(f"Early stopping triggered after epoch {epoch + 1}.")
                     break
+
+        # test the best model
+        test_metrics = self.eov_epoch("test")
+        self._log_epoch_metrics(train_metrics=None, val_metrics=None, test_metrics=test_metrics, epoch=epoch)
     
     def _log_epoch_metrics(self, train_metrics, val_metrics, test_metrics, epoch):
         """Log metrics for both training and validation"""
@@ -204,9 +206,24 @@ class Finetune_Trainer(object):
         )
         os.makedirs(checkpoint_dir, exist_ok=True)
         
+        if self.cfg.train.sq_embed == "ESM2":
+            model_state_dict = {
+                k: v for k, v in self.model.state_dict().items()
+                if not k.startswith('pretrain_model.rsd_encoder')
+            }
+        elif self.cfg.train.sq_embed == "Ensemble":
+            model_state_dict = {
+                k: v for k, v in self.model.state_dict().items()
+                if not k.startswith('pretrain_model.rsd_encoder.esm_encoder')
+            }
+        else:
+            model_state_dict = {
+                k: v for k, v in self.model.state_dict().items()
+            }
+        
         torch.save({
             'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_state_dict,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'metrics': metrics,
         }, os.path.join(checkpoint_dir, "model.pt"))

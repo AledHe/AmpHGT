@@ -7,6 +7,7 @@ from model.utils import get_func
 from utils.std_logger import error, info
 from .readouts import GlobalPooling, HierAttnReadout, SemanticAttentionReadout, MultiHeadedAttention, GRUReadout
 from .sequence_embedding import VOCAB_SIZE, ResidueEncoder
+from .ESM2_ConvTrans_ensemble import ESM_CovT_Ensemble
 from .ESM2 import ESMResidueEncoder
 
 # dgl graph utils
@@ -250,11 +251,13 @@ class PharmHGT(nn.Module):
                 ff_dim=hid_dim * 4,
             ).to(device=device)
         elif sq_embed == "ESM2":
-            self.rsd_encoder = ESMResidueEncoder()
+            self.rsd_encoder = ESMResidueEncoder().to(device)
             self.rsd_dim = ESMResidueEncoder().hidden_dim
+        elif sq_embed == "Ensemble":
+            self.rsd_encoder = ESM_CovT_Ensemble(hid_dim, device).to(device)
 
         # residue view
-        if self.rsd_dim:
+        if hasattr(self, 'rsd_dim'):
             self.w_rsd_proj = nn.Sequential(
                 nn.Linear(self.rsd_dim, hid_dim * 2),
                 nn.ReLU(),
@@ -384,7 +387,7 @@ class PharmHGT_FP(nn.Module):
             self.pooling = GlobalPooling('max')
         else:
             raise ValueError(f"Invalid pooling method: {self.cfg.train.pooling}")
-        
+
         # if readout, remove the pooling layer
         if self.readout:
             self.pooling = None
@@ -394,7 +397,7 @@ class PharmHGT_FP(nn.Module):
         elif self.cfg.train.fusion == 'bilinear':
             self.fusion = BilinearFusion(embed_dim=hid_dim)
         elif self.cfg.train.fusion == 'attention':
-            self.fusion = CrossAttentionFusion(d_model=hid_dim, num_heads=4)
+            self.fusion = BilinearAttentionFusion(d_model=hid_dim, num_heads=4)
         else:
             raise ValueError(f"Invalid pooling method: {self.cfg.train.fusion}")
             
@@ -412,6 +415,14 @@ class PharmHGT_FP(nn.Module):
             device=device,
             sq_embed=sq_embed
         )
+        
+        if sq_embed == "ESM2":
+            self.esm_proj = nn.Sequential(
+                nn.Linear(1280, hid_dim * 2), # hard coded here...
+                nn.ReLU(),
+                nn.Linear(hid_dim * 2, hid_dim),
+                nn.ReLU()
+            )
 
     def load_model(
             self,
@@ -474,6 +485,13 @@ class PharmHGT_FP(nn.Module):
         else:
             bg_embeds = self.pooling(bg)   # (batch_size, hid_dim)
 
+        # print(bg_embeds.size())
+        # print(cls_emb.size())
+        # torch.Size([128, 300])
+        # torch.Size([128, 1280])
+        if self.esm_proj:
+            cls_emb = self.esm_proj(cls_emb)
+
         fused_feats = self.fusion(bg_embeds, cls_emb)  # (batch_size, hid_dim)
 
         # cat_feats = torch.cat([bg_embeds, cls_emb], dim=-1)
@@ -517,25 +535,22 @@ class BilinearFusion(nn.Module):
         fused = self.linear(fused)
         return fused
     
-class CrossAttentionFusion(nn.Module):
-    def __init__(self, d_model, num_heads):
-        super(CrossAttentionFusion, self).__init__()
-        self.multihead_attn = nn.MultiheadAttention(embed_dim=d_model, 
-                                                   num_heads=num_heads, 
-                                                   batch_first=True)
-    def forward(self, feat_gnn, feat_tfm):
-        # feat_gnn, feat_tfm 形状都是 (B, D)
-        # 先拓展成 seq_len=1 的形式 (B, 1, D)
-        feat_gnn = feat_gnn.unsqueeze(1) 
-        feat_tfm = feat_tfm.unsqueeze(1)
+class BilinearAttentionFusion(nn.Module):
+    def __init__(self, embed_dim, num_heads=4):
+        super(BilinearAttentionFusion, self).__init__()
+        self.bilinear = BilinearFusion(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
         
-        # 使用 GNN 特征作为 query，Transformer 特征作为 key & value
-        fusion, _ = self.multihead_attn(query=feat_gnn, 
-                                        key=feat_tfm, 
-                                        value=feat_tfm)
-        # fusion: (B, 1, D)
-        fusion = fusion.squeeze(1)
-        return fusion
+    def forward(self, feat_seq, feat_struct):
+        bilinear_out = self.bilinear(feat_seq, feat_struct)
+        bilinear_out = self.norm(bilinear_out)
+        
+        query = bilinear_out.unsqueeze(1)  # (B, 1, D)
+        kv = torch.cat([feat_seq.unsqueeze(1), feat_struct.unsqueeze(1)], dim=1)  # (B, 2, D)
+        attn_out, weights = self.attention(query, kv, kv)
+        
+        return attn_out.squeeze(1), weights
     
 class MLP(nn.Module):
     """feed bg_embeds to MLP and give binary classification, note that num_classes=1"""

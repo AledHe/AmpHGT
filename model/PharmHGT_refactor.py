@@ -4,7 +4,7 @@ from dgl import function as fn
 from functools import partial
 
 from model.utils import get_func
-from utils.std_logger import error, info
+from utils.std_logger import info
 from .readouts import GlobalPooling, HierAttnReadout, SemanticAttentionReadout, MultiHeadedAttention, GRUReadout
 from .sequence_embedding import VOCAB_SIZE, ResidueEncoder
 from .ESM2_ConvTrans_ensemble import ESM_CovT_Ensemble
@@ -227,7 +227,7 @@ class MVMP(nn.Module):
         #     bg.nodes[ntype].data['f_final'] = fused_feat # (N, hid_dim)
         
 class PharmHGT(nn.Module):
-    def __init__(self, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, device, sq_embed):
+    def __init__(self, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, device, sq_embed, detach_gnn):
         super(PharmHGT,self).__init__()
         # hid_dim = args['hid_dim']
         self.act = get_func(act)
@@ -242,6 +242,7 @@ class PharmHGT(nn.Module):
         self.w_reac = nn.Linear(reac_dim,hid_dim)
         # junction view
         self.w_junc = nn.Linear(atom_dim + pharm_dim, hid_dim)
+        self.detach_gnn = detach_gnn
 
         if sq_embed == "CovTrans":
             self.rsd_encoder = ResidueEncoder(
@@ -331,6 +332,9 @@ class PharmHGT(nn.Module):
         if hasattr(self, 'w_rsd_proj'):
             rsd_emb = self.w_rsd_proj(rsd_emb)  # => [total_num_rsd, hid_dim]
 
+        if self.detach_gnn:
+            return bg, cls_emb
+
         bg.nodes['rsd'].data['f'] = rsd_emb # apply new added residue nodes feature by sequence encoder.
 
         self.init_feature(bg)
@@ -397,7 +401,7 @@ class PharmHGT_FP(nn.Module):
         elif self.cfg.train.fusion == 'bilinear':
             self.fusion = BilinearFusion(embed_dim=hid_dim)
         elif self.cfg.train.fusion == 'attention':
-            self.fusion = BilinearAttentionFusion(d_model=hid_dim, num_heads=4)
+            self.fusion = BilinearAttentionFusion(hid_dim, num_heads=4)
         else:
             raise ValueError(f"Invalid pooling method: {self.cfg.train.fusion}")
             
@@ -413,7 +417,8 @@ class PharmHGT_FP(nn.Module):
             pharm_dim=self.pharm_dim,
             reac_dim=self.reac_dim,
             device=device,
-            sq_embed=sq_embed
+            sq_embed=sq_embed,
+            detach_gnn=self.cfg.train.detach_gnn
         )
         
         if sq_embed == "ESM2":
@@ -435,7 +440,8 @@ class PharmHGT_FP(nn.Module):
             pharm_dim: int,
             reac_dim: int,
             device: torch.device,
-            sq_embed: str
+            sq_embed: str,
+            detach_gnn: bool
         ):
         model = PharmHGT(
             hid_dim=hid_dim,
@@ -446,7 +452,8 @@ class PharmHGT_FP(nn.Module):
             pharm_dim=pharm_dim,
             reac_dim=reac_dim,
             device=device,
-            sq_embed = sq_embed
+            sq_embed = sq_embed,
+            detach_gnn=detach_gnn
         ).to(device)
 
         if not self.load_pretrained:
@@ -463,7 +470,7 @@ class PharmHGT_FP(nn.Module):
         # }, os.path.join(checkpoint_dir, "model.pt"))
 
         state_dict = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(state_dict["encoder_state_dict"])
+        model.load_state_dict(state_dict["encoder_state_dict"], strict=False)
 
         # print model and estimate parameters
         info(f"loaded model from {checkpoint_path}, with {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters.") 
@@ -474,10 +481,17 @@ class PharmHGT_FP(nn.Module):
         # embedding extraction
         if self.load_pretrained and not self.cfg.train.full_ft:
             # do not mess up the pretrained model
+            self.pretrain_model.eval()
             with torch.no_grad():
                 bg, cls_emb = self.pretrain_model(bg, finetune=True) # cls_emb: (batch_size, conv_channels), conv_channels = hid_dim
         else:
             bg, cls_emb = self.pretrain_model(bg, finetune=True)
+
+        if self.cfg.train.detach_gnn:
+            if hasattr(self, 'esm_proj'):
+                cls_emb = self.esm_proj(cls_emb)
+            logits = self.mlp(cls_emb)
+            return logits
 
         # if readout, or pooling
         if self.readout:
@@ -489,7 +503,7 @@ class PharmHGT_FP(nn.Module):
         # print(cls_emb.size())
         # torch.Size([128, 300])
         # torch.Size([128, 1280])
-        if self.esm_proj:
+        if hasattr(self, 'esm_proj'):
             cls_emb = self.esm_proj(cls_emb)
 
         fused_feats = self.fusion(bg_embeds, cls_emb)  # (batch_size, hid_dim)
@@ -548,9 +562,9 @@ class BilinearAttentionFusion(nn.Module):
         
         query = bilinear_out.unsqueeze(1)  # (B, 1, D)
         kv = torch.cat([feat_seq.unsqueeze(1), feat_struct.unsqueeze(1)], dim=1)  # (B, 2, D)
-        attn_out, weights = self.attention(query, kv, kv)
+        attn_out, weights = self.attention(query, kv, kv) # (B, 1, D), (B, 1, 2)
         
-        return attn_out.squeeze(1), weights
+        return attn_out.squeeze(1) # (B, D)
     
 class MLP(nn.Module):
     """feed bg_embeds to MLP and give binary classification, note that num_classes=1"""
@@ -573,12 +587,8 @@ class MLP(nn.Module):
     
 class AmpHGT_FT(PharmHGT_FP):
     """
-    AmpHGT (PharmHGT_pretrained + pooling/readout) trained. FT: From Trained.
-    Inference-optimized version with inheritance
-
-    1. Force load_pretrained=False (since weights are in state_dict)
-    2. Add inference-specific forward
-    3. Provide loading interface
+    AmpHGT (PharmHGT_pretrained + pooling/readout) for inference. FT: From Trained.
+    Inference-optimized version with proper handling of ESM components.
     """
     def __init__(self, *args, **kwargs):
         super().__init__(
@@ -590,12 +600,12 @@ class AmpHGT_FT(PharmHGT_FP):
     def forward(self, bg):
         """ Inference-optimized forward """
         with torch.no_grad():
-            # call the parent forward
             logits = super().forward(bg)
             return logits
         
     @classmethod
-    def from_checkpoint(cls, checkpoint_path, cfg, device, **kwargs):
+    def from_checkpoint(cls, checkpoint_path, cfg, device, sq_embed="ESM2", **kwargs):
+        # 1. Create model instance with proper configuration
         model = cls(
             cfg=cfg,
             hid_dim=cfg.train.hid_dim,
@@ -606,16 +616,36 @@ class AmpHGT_FT(PharmHGT_FP):
             pharm_dim=cfg.train.pharm_dim,
             reac_dim=cfg.train.reac_dim,
             device=device,
+            sq_embed=sq_embed,  # Use the specified embedder
             **kwargs
         )
-
+        
+        # 2. Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=device)
-
+        
+        # 3. Handle state_dict (remove module. prefix if using DDP)
         state_dict = {
-            k.replace('module.', ''): v  # if DDP, remove the 'module.' prefix
+            k.replace('module.', ''): v
             for k, v in checkpoint['model_state_dict'].items()
         }
-        model.load_state_dict(state_dict, strict=True)
-        info(f"loaded model from {checkpoint_path}, with {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters.") 
+        
+        # 4. Load state_dict with strict=False to ignore missing ESM keys
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        
+        # 5. Log the loading process
+        info(f"Loaded model from {checkpoint_path}")
+        info(f"Missing keys (expected for ESM components): {len(missing_keys)} keys")
+        info(f"Unexpected keys: {len(unexpected_keys)} keys")
+        info(f"Model has {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters")
+        
+        # 6. Ensure ESM components are in eval mode
+        if sq_embed == "ESM2":
+            if hasattr(model.pretrain_model, 'rsd_encoder'):
+                model.pretrain_model.rsd_encoder.eval()
+        elif sq_embed == "Ensemble":
+            if hasattr(model.pretrain_model, 'rsd_encoder') and hasattr(model.pretrain_model.rsd_encoder, 'esm_encoder'):
+                model.pretrain_model.rsd_encoder.esm_encoder.eval()
+        
+        # Set entire model to eval mode
         model.eval()
         return model

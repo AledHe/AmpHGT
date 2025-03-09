@@ -235,13 +235,14 @@ class Masking_Trainer(object):
 
     def run(self):
         """Complete training loop"""
+        best_checkpoint_path = None
+        
         for epoch in range(self.cfg.train.epochs):
             if self.early_stop:
                 break
 
             # training
             train_metrics = self.train_epoch()
-
             self._log_epoch_metrics(train_metrics=train_metrics, val_metrics=None, test_metrics=None, epoch=epoch)
 
             if self.early_stop:
@@ -249,21 +250,48 @@ class Masking_Trainer(object):
             
             # validation
             val_metrics = self.eov_epoch(stage='valid')
-
             self._log_epoch_metrics(train_metrics=None, val_metrics=val_metrics, test_metrics=None, epoch=epoch)
 
             # Model selection and early stopping
             if val_metrics['loss'] < self.best_loss:
                 self.best_loss = val_metrics['loss']
                 self.patience_counter = 0
-                self._save_checkpoint(epoch, val_metrics, "best")
+                checkpoint_path = self._save_checkpoint(epoch, val_metrics, "best")
+                best_checkpoint_path = checkpoint_path
             else:
                 self.patience_counter += 1
                 if self.patience_counter >= self.cfg.train.patience:
                     info(f"Early stopping triggered after epoch {epoch + 1}.")
                     break
         
-        # test
+        if best_checkpoint_path:
+            info(f"Loading best model from {best_checkpoint_path} for testing")
+            checkpoint = torch.load(
+                os.path.join(best_checkpoint_path, "model.pt"),
+                map_location=self.device
+            )
+            
+            encoder_state_dict = {
+                k.replace('module.', ''): v 
+                for k, v in checkpoint['encoder_state_dict'].items()
+            }
+            self.encoder.load_state_dict(encoder_state_dict, strict=False)
+            
+            decoder_state_dict = {
+                k.replace('module.', ''): v 
+                for k, v in checkpoint['decoder_state_dict'].items()
+            }
+            self.decoder.load_state_dict(decoder_state_dict, strict=True)  # decoder 应完整加载
+            
+            if self.cfg.train.sq_embed in ["ESM2", "Ensemble"]:
+                if hasattr(self.encoder, 'pretrain') and hasattr(self.encoder.pretrain, 'rsd_encoder'):
+                    self.encoder.pretrain.rsd_encoder.eval()
+                    for param in self.encoder.pretrain.rsd_encoder.parameters():
+                        param.requires_grad = False
+                    
+            self.encoder.eval()
+            self.decoder.eval()
+        
         test_metrics = self.eov_epoch(stage='test')
         self._log_epoch_metrics(train_metrics=None, val_metrics=None, test_metrics=test_metrics, epoch=epoch)
 
@@ -296,16 +324,35 @@ class Masking_Trainer(object):
             f"checkpoint_epoch_{epoch}" + (f"_{step_suffix}" if step_suffix else "")
         )
         os.makedirs(checkpoint_dir, exist_ok=True)
+
+        encoder = self.encoder.module if isinstance(self.encoder, torch.nn.DataParallel) else self.encoder
+        decoder = self.decoder.module if isinstance(self.decoder, torch.nn.DataParallel) else self.decoder
+
+        encoder_state_dict = encoder.state_dict()
+        if self.cfg.train.sq_embed == "ESM2":
+            filtered_encoder_dict = {
+                k: v for k, v in encoder_state_dict.items()
+                if not k.startswith('pretrain.rsd_encoder')
+            }
+        elif self.cfg.train.sq_embed == "Ensemble":
+            filtered_encoder_dict = {
+                k: v for k, v in encoder_state_dict.items()
+                if not k.startswith('pretrain.rsd_encoder.esm_encoder')
+            }
+        else:
+            filtered_encoder_dict = encoder_state_dict
+        
+        decoder_state_dict = decoder.state_dict()
         
         torch.save({
             'epoch': epoch,
-            'encoder_state_dict': self.encoder.state_dict(),
-            'decoder_state_dict': self.decoder.state_dict(),
+            'encoder_state_dict': filtered_encoder_dict,
+            'decoder_state_dict': decoder_state_dict,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'metrics': metrics,
         }, os.path.join(checkpoint_dir, "model.pt"))
         
         with open(os.path.join(checkpoint_dir, "metrics.json"), "w") as f:
             json.dump(metrics, f)
-
         info(f"Checkpoint saved at {checkpoint_dir}.")
+        return checkpoint_dir

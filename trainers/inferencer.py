@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from utils.std_logger import info
 from model.utils import compute_need_metrics, compute_confusion_matrix, plot_roc_curve
@@ -40,11 +41,8 @@ class Inferencer_Binary(object):
 
         accuracy, precision, sensitivity, specificity, f1, mcc = compute_need_metrics(all_preds, all_trues)
         cm = compute_confusion_matrix(all_preds, all_trues)
-        info("Confusion Matrix:")
-        info(cm)
 
         roc_auc = plot_roc_curve(all_preds, all_trues, save_path=self.cfg.logger.log_dir)
-        info("AUC-ROC:", roc_auc)
 
         metrics_tracker['accuracy'] = accuracy
         metrics_tracker['precision'] = precision
@@ -52,5 +50,39 @@ class Inferencer_Binary(object):
         metrics_tracker['specificity'] = specificity
         metrics_tracker['f1'] = f1
         metrics_tracker['mcc'] = mcc
+        metrics_tracker['roc_auc'] = roc_auc
 
-        info(metrics_tracker)
+        metric_labels = {
+            'accuracy': 'Accuracy',
+            'precision': 'Precision',
+            'sensitivity': 'Sensitivity',
+            'specificity': 'Specificity',
+            'f1': 'F1 Score',
+            'mcc': 'MCC',
+            'roc_auc': 'ROC AUC'
+        }
+        max_len = max(len(label) for label in metric_labels.values())
+        header = f"\n{' Evaluation Metrics ':=^{max_len+14}}"
+        footer = f"{'':=<{max_len+14}}"
+        
+        metrics_str = [header]
+        for key in ['accuracy', 'precision', 'sensitivity', 'specificity', 'f1', 'mcc', 'roc_auc']:
+            label = metric_labels[key]
+            value = metrics_tracker[key]
+            metrics_str.append(f"| {label:<{max_len}} | {value:^8.4f} |")
+        
+        metrics_str.append(footer)
+        info('\n'.join(metrics_str))
+
+        cm_array = np.array(cm)
+        total = cm_array.sum()
+        header = "\nConfusion Matrix (Counts)"
+        table_str = [
+            header,
+            "          Actual",
+            "        Neg    Pos",
+            f"Pred Neg  {cm[0][0]:<4}  {cm[0][1]:<4}",
+            f"     Pos  {cm[1][0]:<4}  {cm[1][1]:<4}",
+            f"\nTotal samples: {total}"
+        ]
+        info('\n'.join(table_str))

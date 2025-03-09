@@ -123,7 +123,8 @@ def pretrain_main(cfg: Cfig):
         cfg.train.pharm_dim, 
         cfg.train.reac_dim,
         devices,
-        cfg.train.sq_embed
+        cfg.train.sq_embed,
+        cfg.train.detach_gnn
     ).to(devices)
 
     ### New head added 24.10.24

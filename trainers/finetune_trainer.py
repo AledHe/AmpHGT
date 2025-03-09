@@ -146,6 +146,8 @@ class Finetune_Trainer(object):
         return metrics_tracker
     
     def run(self):
+        best_checkpoint_path = None
+
         for epoch in range(self.cfg.train.epochs):
             if self.early_stop:
                 break
@@ -165,12 +167,37 @@ class Finetune_Trainer(object):
             if val_metrics['mcc'] > self.best_mcc:
                 self.best_mcc = val_metrics['mcc']
                 self.patience_counter = 0
-                self._save_checkpoint(epoch, val_metrics, "best")
+                checkpoint_path = self._save_checkpoint(epoch, val_metrics, "best")
+                best_checkpoint_path = checkpoint_path
             else:
                 self.patience_counter += 1
                 if self.patience_counter >= self.cfg.train.patience:
                     info(f"Early stopping triggered after epoch {epoch + 1}.")
                     break
+
+        if best_checkpoint_path:
+            info(f"Loading best model from {best_checkpoint_path} for testing")
+            checkpoint = torch.load(
+                os.path.join(best_checkpoint_path, "model.pt"),
+                map_location=self.device
+            )
+            
+            state_dict = {
+                k.replace('module.', ''): v 
+                for k, v in checkpoint['model_state_dict'].items()
+            }
+            
+            self.model.load_state_dict(state_dict, strict=False)
+            
+            if self.cfg.train.sq_embed == "ESM2":
+                if hasattr(self.model.pretrain_model, 'rsd_encoder'):
+                    self.model.pretrain_model.rsd_encoder.eval()
+            elif self.cfg.train.sq_embed == "Ensemble":
+                if hasattr(self.model.pretrain_model, 'rsd_encoder') and \
+                hasattr(self.model.pretrain_model.rsd_encoder, 'esm_encoder'):
+                    self.model.pretrain_model.rsd_encoder.esm_encoder.eval()
+            
+            self.model.eval()
 
         # test the best model
         test_metrics = self.eov_epoch("test")
@@ -232,6 +259,8 @@ class Finetune_Trainer(object):
             json.dump(metrics, f)
 
         info(f"Checkpoint saved at {checkpoint_dir}.")
+
+        return checkpoint_dir
 
 class Finetune_Trainer_RG(object):
     def __init__(self,

@@ -45,16 +45,16 @@ def plot_roc_curve(all_preds, all_trues, save_path):
     roc_auc = auc(fpr, tpr)
 
     # 绘制 ROC 曲线
-    plt.figure()
-    plt.plot(fpr, tpr, color='darkorange', lw=2, label='ROC curve (area = %0.2f)' % roc_auc)
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Receiver Operating Characteristic (ROC) Curve')
-    plt.legend(loc="lower right")
-    plt.savefig(f'{save_path}/roc_curve.png', dpi=300)
+    # plt.figure()
+    # plt.plot(fpr, tpr, color='darkorange', lw=2, label='ROC curve (area = %0.2f)' % roc_auc)
+    # plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    # plt.xlim([0.0, 1.0])
+    # plt.ylim([0.0, 1.05])
+    # plt.xlabel('False Positive Rate')
+    # plt.ylabel('True Positive Rate')
+    # plt.title('Receiver Operating Characteristic (ROC) Curve')
+    # plt.legend(loc="lower right")
+    # plt.savefig(f'{save_path}/roc_curve.png', dpi=300)
 
     return roc_auc
 

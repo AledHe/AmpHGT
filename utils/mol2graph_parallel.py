@@ -71,9 +71,7 @@ def process_mol(mol):
     g = mol_to_heterograph_standalone(mol)
     if g.number_of_nodes() == 0:
         raise ValueError(f"Molecule {mol.GetProp('_Name')} has no nodes.")
-    # Example: label = -1 for pretrain
-    label = -1
-    return g, label
+    return g
     
 def bin_save(batch, cache_dir, stage, chunk_idx):
     graphs = [g for g, _ in batch]
@@ -99,12 +97,12 @@ def process_chunk_of_mols(args):
     
     Returns only the chunk index (or some small success flag).
     """
-    chunk_idx, chunk_data, cache_sub_dir, stage, mask_graph = args
+    chunk_idx, chunk_data, cache_sub_dir, stage, mask_graph, label = args
     
     current_batch = []
     for mol in chunk_data:
         try:
-            g, label = process_mol(mol)
+            g = process_mol(mol)
             if mask_graph and global_cfg.train.train_tag == "s1_pretrain":
                 mask_graph(g)
             current_batch.append((g, label))
@@ -141,6 +139,19 @@ def single_process_test(cfg, mol_data, vocab_dict, cache_dir, stage, frag_method
         chunk_idx += 1
         exit()
 
+def infer_label(sdf_path):
+    """
+    Determine the label for a molecule based on the SDF file path.
+    """
+    if "unlabel" in sdf_path:
+        return -1
+    elif "positive" in sdf_path:
+        return 1
+    elif "negative" in sdf_path:
+        return 0
+    else:
+        raise ValueError("Invalid SDF file name or labeling logic not handled.")
+
 def save_cache_standalone(cfg, mol_data, vocab_dict, cache_dir, stage, frag_method,
                           chunk_size=500, num_workers=None, mask_graph=None, sdf_path=None):
     """
@@ -152,6 +163,9 @@ def save_cache_standalone(cfg, mol_data, vocab_dict, cache_dir, stage, frag_meth
     os.makedirs(cache_sub_dir, exist_ok=True)
 
     # single_process_test(cfg, mol_data, vocab_dict, cache_sub_dir, stage, frag_method, mask_graph)
+
+    label = infer_label(sdf_path=sdf_path)
+    print(f"Label for {sdf_path} is {label}")
 
     if num_workers is None:
         num_workers = multiprocessing.cpu_count()
@@ -173,7 +187,7 @@ def save_cache_standalone(cfg, mol_data, vocab_dict, cache_dir, stage, frag_meth
 
         # We chunk the mol_data generator
         chunk_args_iter = (
-            (chunk_idx, chunk, cache_sub_dir, stage, mask_graph)
+            (chunk_idx, chunk, cache_sub_dir, stage, mask_graph, label)
             for chunk_idx, chunk in enumerate(chunked_iterable(mol_data, chunk_size))
         )
 
@@ -188,7 +202,7 @@ def save_cache_standalone(cfg, mol_data, vocab_dict, cache_dir, stage, frag_meth
 
     print(f"Info: All {len(results)} chunks processed and saved to {cache_sub_dir}.")
 
-def mol2graph(cfg, args, mask_graph, sdf_path):
+def mol2graph(cfg, args, mask_graph, sdf_path, stage):
     vocab_dict = load_vocabdict(cfg.data.vocablist)
 
     file_type = os.path.splitext(sdf_path)[1].lstrip('.').lower()
@@ -202,7 +216,7 @@ def mol2graph(cfg, args, mask_graph, sdf_path):
                           mol_data, 
                           vocab_dict, 
                           cfg.data.tmp_dir, 
-                          args.stage, 
+                          stage, 
                           cfg.train.frag_method, 
                           cfg.data.chunk_size, 
                           args.num_workers,

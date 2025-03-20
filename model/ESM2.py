@@ -80,14 +80,13 @@ class ESMResidueEncoder(nn.Module):
             
             num_rsd = g.num_nodes('rsd')
             
-            seq_length = num_rsd + 1  # +1 for <cls>
-            seq_features = hidden_states[i, :seq_length]
+            seq_features = hidden_states[i, :num_rsd + 2]  # +2 for CLS and EOS
             
             cls_feat = seq_features[0]
             cls_features.append(cls_feat)
             
             # extract residue feature and restore origin sequence
-            rsd_feats = seq_features[1:]  # [num_rsd, hidden_dim]
+            rsd_feats = seq_features[1:-1]  # [num_rsd, hidden_dim]
             rsd_feats = rsd_feats[batch_inv_indices[i]]
             rsd_features.append(rsd_feats)
         

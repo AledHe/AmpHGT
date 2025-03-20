@@ -27,7 +27,7 @@ from trainers.pretrain_trainer import Masking_Trainer
 from trainers.finetune_trainer import Finetune_Trainer
 from trainers.inferencer import Inferencer_Binary
 
-from model.PharmHGT_refactor import PharmHGT, PharmHGT_FP, AmpHGT_FT
+from model.PharmHGT_refactor import PharmHGT, PharmHGT_FP, AmpHGT_FT, AmpHGT_CT
 from model.scheduler import NoamLR
 # from model.pretrain_heads import PretrainingHeads, PretrainingMetrics, ReconstructionLoss
 
@@ -124,7 +124,8 @@ def pretrain_main(cfg: Cfig):
         cfg.train.reac_dim,
         devices,
         cfg.train.sq_embed,
-        cfg.train.detach_gnn
+        cfg.train.detach_gnn,
+        cfg.train.view
     ).to(devices)
 
     ### New head added 24.10.24
@@ -141,7 +142,7 @@ def pretrain_main(cfg: Cfig):
 
     info("Setting up optimizers...")
     # Combined optimizer for encoder and decoder
-    optimizer = optim.Adam(
+    optimizer = optim.AdamW(
         list(encoder.parameters()) + list(decoder.parameters()),
         lr=cfg.train.lr,
         weight_decay=cfg.train.decay
@@ -206,22 +207,31 @@ def finetune_binary_main(cfg: Cfig):
         )
     
     info("Setting up model...")
-    model = PharmHGT_FP(
-        cfg,
-        cfg.train.hid_dim, 
-        cfg.train.act, 
-        cfg.train.num_layer,
-        cfg.train.atom_dim, 
-        cfg.train.bond_dim,
-        cfg.train.pharm_dim, 
-        cfg.train.reac_dim,
-        devices,
-        cfg.train.sq_embed,
-        cfg.train.load_pretrained
-    ).to(devices)
+    if cfg.train.continue_training:
+        model = AmpHGT_CT.from_checkpoint(
+            checkpoint_path=cfg.train.checkpoint_path,  # this path is not MGM pretrained. 
+                                                        # MGM pretrained is loaded by unlabel_checkpoint_path with cfg.train.load_pretrained on.
+            cfg=cfg,
+            device=devices,
+            sq_embed=cfg.train.sq_embed
+        ).to(devices)
+    else:
+        model = PharmHGT_FP(
+            cfg,
+            cfg.train.hid_dim, 
+            cfg.train.act, 
+            cfg.train.num_layer,
+            cfg.train.atom_dim, 
+            cfg.train.bond_dim,
+            cfg.train.pharm_dim, 
+            cfg.train.reac_dim,
+            devices,
+            cfg.train.sq_embed,
+            cfg.train.load_pretrained
+        ).to(devices)
     
     info("Setting up optimizers...")
-    optimizer = optim.Adam(
+    optimizer = optim.AdamW(
         model.parameters(),
         lr=cfg.train.lr,
         weight_decay=cfg.train.decay
@@ -300,7 +310,7 @@ def finetune_regression_main(cfg: Cfig):
     ).to(devices)
 
     info("Setting up optimizers...")
-    optimizer = optim.Adam(
+    optimizer = optim.AdamW(
         model.parameters(),
         lr=cfg.train.lr,
         weight_decay=cfg.train.decay
@@ -381,6 +391,47 @@ def inference_binary_main(cfg: Cfig):
 
     info("finished inference......")
 
+@lcfig(config_path = 'configs/inference_umap.yaml', output_dir = "out_dim_reduce")
+def dim_reduce_main(cfg: Cfig):
+    ensure_dir_exists(cfg.logger.log_dir)
+
+    initialize_logger(cfg.logger.log_dir)
+
+    # Initialize the random seed and device configuration for reproducibility
+    devices = setup_seed_reproducibility(cfg.train.seed, cfg.train.cuda_deterministic)
+
+    devices = devices[0]
+
+    info("Creating DataLoaders...")
+
+    inference_loader, vocab_dict = make_binary_loaders(
+        cfg, 
+        batch_size=cfg.train.batch_size,
+        mask_graph=None,
+        inference=True
+    ) # inference loader only load test path data.
+
+    info("Setting up model...")
+    model = AmpHGT_FT.from_checkpoint(
+        checkpoint_path=cfg.train.checkpoint_path,
+        cfg=cfg,
+        device=devices,
+        sq_embed=cfg.train.sq_embed
+    ).to(devices)
+
+    inferencer = Inferencer_Binary(
+        cfg=cfg,
+        dataloaders=inference_loader, # this is a dict with "test" only.
+        model=model,
+        device=devices
+    )
+
+    info("Starting umap...")
+
+    inferencer.umap(n_neighbors=cfg.umap.n_neighbors, min_dist=cfg.umap.min_dist, out_path=cfg.logger.log_dir)
+
+    info("finished umap......")
+
 @lcfig(config_path = 'configs/extract_embeddings_encoder.yaml', output_dir = "out_extract_encoder_embeddings")
 def extract_embeddings_encoder_main(cfg: Cfig):
     pass
@@ -413,5 +464,7 @@ if __name__ == '__main__':
         extract_embeddings_encoder_main(config_path=args.config, output_dir=args.output_dir, unk_args=unknown_args)
     elif args.mode == 'fa':
         extract_embeddings_amphgt_main(config_path=args.config, output_dir=args.output_dir, unk_args=unknown_args)
+    elif args.mode == 'umap':
+        dim_reduce_main(config_path=args.config, output_dir=args.output_dir, unk_args=unknown_args)
     else:
         raise ValueError(f"Invalid mode: {args.mode}")

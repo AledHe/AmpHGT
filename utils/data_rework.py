@@ -178,17 +178,30 @@ class FinetuneDataLoader(Dataset):
             - train_sdf_pos, train_sdf_neg
             - valid_sdf_pos, valid_sdf_neg
             - test_sdf_pos, test_sdf_neg
+        
+        This function now checks if the returned paths are valid (exist) before returning.
+        If a path is invalid, it's excluded from the returned list.  If all paths
+        for a stage are invalid, an empty list is returned for that stage.
         """
         if stage == "train":
-            return [self.cfg.data.train_sdf_pos, self.cfg.data.train_sdf_neg]
+            paths = [self.cfg.data.train_sdf_pos, self.cfg.data.train_sdf_neg]
         elif stage == "valid":
-            return [self.cfg.data.valid_sdf_pos, self.cfg.data.valid_sdf_neg]
+            paths = [self.cfg.data.valid_sdf_pos, self.cfg.data.valid_sdf_neg]
         elif stage == "test":
-            return [self.cfg.data.test_sdf_pos, self.cfg.data.test_sdf_neg]
+            paths = [self.cfg.data.test_sdf_pos, self.cfg.data.test_sdf_neg]
         elif stage == "generate_vocabdict":
-            return [self.cfg.data.dataset]
+            paths = [self.cfg.data.dataset]
         else:
             raise ValueError(f"Unknown stage: {stage}")
+        valid_paths = []
+        for path in paths:
+            if isinstance(path, str) and os.path.exists(path):  # Check if path is a string and exists
+                valid_paths.append(path)
+            elif isinstance(path, str):
+                print(f"Warning: Path '{path}' for stage '{stage}' does not exist and will be ignored.")
+            else:
+                print(f"Warning: Invalid path type '{type(path)}' for stage '{stage}'.  Expected a string.")
+        return valid_paths
 
     def mol_to_heterograph(self, sdf_path):
         """

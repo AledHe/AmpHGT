@@ -148,32 +148,36 @@ class Finetune_Trainer(object):
     def run(self):
         best_checkpoint_path = None
 
-        for epoch in range(self.cfg.train.epochs):
-            if self.early_stop:
-                break
-
-            train_metrics = self.train_epoch()
-
-            self._log_epoch_metrics(train_metrics=train_metrics, val_metrics=None, test_metrics=None, epoch=epoch)
-
-            if self.early_stop:
-                break
-
-            val_metrics = self.eov_epoch("valid")
-
-            self._log_epoch_metrics(train_metrics=None, val_metrics=val_metrics, test_metrics=None, epoch=epoch)
-
-            # Model selection and early stopping
-            if val_metrics['mcc'] > self.best_mcc:
-                self.best_mcc = val_metrics['mcc']
-                self.patience_counter = 0
-                checkpoint_path = self._save_checkpoint(epoch, val_metrics, "best")
-                best_checkpoint_path = checkpoint_path
-            else:
-                self.patience_counter += 1
-                if self.patience_counter >= self.cfg.train.patience:
-                    info(f"Early stopping triggered after epoch {epoch + 1}.")
+        try:
+            for epoch in range(self.cfg.train.epochs):
+                if self.early_stop:
                     break
+
+                train_metrics = self.train_epoch()
+
+                self._log_epoch_metrics(train_metrics=train_metrics, val_metrics=None, test_metrics=None, epoch=epoch)
+
+                if self.early_stop:
+                    break
+
+                val_metrics = self.eov_epoch("valid")
+
+                self._log_epoch_metrics(train_metrics=None, val_metrics=val_metrics, test_metrics=None, epoch=epoch)
+
+                # Model selection and early stopping
+                if val_metrics['mcc'] > self.best_mcc:
+                    self.best_mcc = val_metrics['mcc']
+                    self.patience_counter = 0
+                    checkpoint_path = self._save_checkpoint(epoch, val_metrics, "best")
+                    best_checkpoint_path = checkpoint_path
+                else:
+                    self.patience_counter += 1
+                    if self.patience_counter >= self.cfg.train.patience:
+                        info(f"Early stopping triggered after epoch {epoch + 1}.")
+                        break
+
+        except KeyboardInterrupt:
+            info("Exiting training loop and testing the best model...")
 
         if best_checkpoint_path:
             info(f"Loading best model from {best_checkpoint_path} for testing")

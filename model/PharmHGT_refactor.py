@@ -1,3 +1,4 @@
+import dgl
 import torch
 from torch import nn
 from dgl import function as fn
@@ -5,10 +6,13 @@ from functools import partial
 
 from model.utils import get_func
 from utils.std_logger import info
-from .readouts import GlobalPooling, HierAttnReadout, SemanticAttentionReadout, MultiHeadedAttention, GRUReadout
+from .readouts import GlobalPooling, HierAttnReadout, SemanticAttentionReadout, MultiHeadedAttention, GRUReadout, TCNReadout
 from .sequence_embedding import VOCAB_SIZE, ResidueEncoder
 from .ESM2_ConvTrans_ensemble import ESM_CovT_Ensemble
 from .ESM2 import ESMResidueEncoder
+
+# TODO: 看起来解释Hetero Graph节点对于图级别分类实现较为困难，且时间不够了。
+# 我决定：挑选一些包含有NCAA的肽，例如BrevicidineB，Cilagicin（cilagicin-BP，dodecacilagicin），将其关键NCAA活性位点替换。观察模型是否给出相同的预测。
 
 # dgl graph utils
 def reverse_edge(tensor):
@@ -227,7 +231,7 @@ class MVMP(nn.Module):
         #     bg.nodes[ntype].data['f_final'] = fused_feat # (N, hid_dim)
         
 class PharmHGT(nn.Module):
-    def __init__(self, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, device, sq_embed, detach_gnn):
+    def __init__(self, hid_dim, act, depth, atom_dim, bond_dim, pharm_dim, reac_dim, device, sq_embed, detach_gnn, view="apjr"):
         super(PharmHGT,self).__init__()
         # hid_dim = args['hid_dim']
         self.act = get_func(act)
@@ -272,7 +276,7 @@ class PharmHGT(nn.Module):
         # self.mp = MVMP(msg_func=add_attn,hid_dim=hid_dim,depth=self.depth,view='aj',suffix='h',act=self.act)
         # ('a','b','a'), ('p','r','p'), ('a','j','p'), ('p','j','a') are in apj view.
         # so there might no need to run 'a', 'ap' in advance.
-        self.mp = MVMP(msg_func=add_attn, hid_dim=hid_dim, depth=self.depth, view='apjr', suffix='h', act=self.act)
+        self.mp = MVMP(msg_func=add_attn, hid_dim=hid_dim, depth=self.depth, view=view, suffix='h', act=self.act)
         # self.mp_junc = MVMP(msg_func=add_attn,hid_dim=hid_dim,depth=self.depth,view='apj',suffix='j',act=self.act)
 
         self.initialize_weights()
@@ -321,12 +325,17 @@ class PharmHGT(nn.Module):
 
         bg.nodes['rsd'].data['f_junc'] = self.act(self.w_rsd_junc(bg.nodes['rsd'].data['f_junc']))
         
-    def forward(self,bg, finetune=False):
+    def forward(self,bg, finetune=False, return_intermediate=False):
         """
         Args:
             bg: a batch of graphs
         """
         rsd_emb, cls_emb = self.rsd_encoder(bg) # (num_nodes, conv_channels), (batch_size, conv_channels)
+
+        if return_intermediate:
+            bg.nodes['a'].data['f_init'] = bg.nodes['a'].data['f'].detach().clone() # (num_nodes, hid_dim)
+            bg.nodes['p'].data['f_init'] = bg.nodes['p'].data['f'].detach().clone() # (num_nodes, hid_dim)
+            bg.nodes['rsd'].data['f_init'] = rsd_emb.detach().clone() # (num_nodes, hid_dim)
 
         # for esm, we need to project hidden_dim.
         if hasattr(self, 'w_rsd_proj'):
@@ -341,7 +350,12 @@ class PharmHGT(nn.Module):
         self.mp(bg)
         
         if finetune:
-            return bg, cls_emb
+            if return_intermediate:
+                return bg, cls_emb, {'a_init': dgl.mean_nodes(bg, 'f_init', ntype='a'), 'a_post_gnn': dgl.mean_nodes(bg, 'f_h', ntype='a'),
+                                     'p_init': dgl.mean_nodes(bg, 'f_init', ntype='p'), 'p_post_gnn': dgl.mean_nodes(bg, 'f_h', ntype='p'),
+                                     'rsd_init': dgl.mean_nodes(bg, 'f_init', ntype='rsd'), 'rsd_post_gnn': dgl.mean_nodes(bg, 'f_h', ntype='rsd')}
+            else:
+                return bg, cls_emb
         else:
             return self.encoder(bg, cls_emb)
 
@@ -374,6 +388,10 @@ class PharmHGT_FP(nn.Module):
         self.reac_dim = reac_dim
         self.load_pretrained = load_pretrained
 
+        if self.cfg.train.tcn:
+            info("TCN is enabled.")
+            self.tcn = TCNReadout(hid_dim, hid_dim)
+
         if self.cfg.train.readout == 'har':
             self.readout = HierAttnReadout(hid_dim)
         elif self.cfg.train.readout == 'gru':
@@ -398,17 +416,23 @@ class PharmHGT_FP(nn.Module):
 
         if self.cfg.train.fusion == 'gate':
             self.fusion = GatedFusion(embed_dim=hid_dim)
+            if self.cfg.train.tcn:
+                self.fusion_sq = GatedFusion(embed_dim=hid_dim)
         elif self.cfg.train.fusion == 'bilinear':
             self.fusion = BilinearFusion(embed_dim=hid_dim)
+            if self.cfg.train.tcn:
+                self.fusion_sq = BilinearFusion(embed_dim=hid_dim)
         elif self.cfg.train.fusion == 'attention':
-            self.fusion = BilinearAttentionFusion(hid_dim, num_heads=4)
+            self.fusion = BilinearAttentionFusion(embed_dim=hid_dim, num_heads=4)
+            if self.cfg.train.tcn:
+                self.fusion_sq = BilinearAttentionFusion(embed_dim=hid_dim, num_heads=4)
         else:
             raise ValueError(f"Invalid pooling method: {self.cfg.train.fusion}")
             
-        self.mlp = MLP(hid_dim=hid_dim, num_classes=cfg.train.num_tasks, input_dim=hid_dim)
+        self.mlp = MLP(num_classes=cfg.train.num_tasks, input_dim=hid_dim)
 
         self.pretrain_model = self.load_model(
-            checkpoint_path=self.cfg.train.checkpoint_path,
+            checkpoint_path=self.cfg.train.unlabel_checkpoint_path,
             hid_dim=self.output_dim,
             act=self.act,
             depth=self.depth,
@@ -418,7 +442,8 @@ class PharmHGT_FP(nn.Module):
             reac_dim=self.reac_dim,
             device=device,
             sq_embed=sq_embed,
-            detach_gnn=self.cfg.train.detach_gnn
+            detach_gnn=self.cfg.train.detach_gnn,
+            view=self.cfg.train.view,
         )
         
         if sq_embed == "ESM2":
@@ -431,7 +456,7 @@ class PharmHGT_FP(nn.Module):
 
     def load_model(
             self,
-            checkpoint_path: str,
+            checkpoint_path: str, # MGM pretrained path.
             hid_dim: int,
             act: str,
             depth: int,
@@ -441,7 +466,8 @@ class PharmHGT_FP(nn.Module):
             reac_dim: int,
             device: torch.device,
             sq_embed: str,
-            detach_gnn: bool
+            detach_gnn: bool,
+            view: str
         ):
         model = PharmHGT(
             hid_dim=hid_dim,
@@ -453,7 +479,8 @@ class PharmHGT_FP(nn.Module):
             reac_dim=reac_dim,
             device=device,
             sq_embed = sq_embed,
-            detach_gnn=detach_gnn
+            detach_gnn=detach_gnn,
+            view=view
         ).to(device)
 
         if not self.load_pretrained:
@@ -477,21 +504,31 @@ class PharmHGT_FP(nn.Module):
 
         return model
     
-    def forward(self, bg):
+    def forward(self, bg, return_intermediate=False):
         # embedding extraction
         if self.load_pretrained and not self.cfg.train.full_ft:
-            # do not mess up the pretrained model
+            # do not mess up the pretrained model, Discarded for degraded performance.
             self.pretrain_model.eval()
             with torch.no_grad():
-                bg, cls_emb = self.pretrain_model(bg, finetune=True) # cls_emb: (batch_size, conv_channels), conv_channels = hid_dim
+                if return_intermediate:
+                    bg, cls_emb, intermediate = self.pretrain_model(bg, finetune=True, return_intermediate=True)
+                else:
+                    bg, cls_emb = self.pretrain_model(bg, finetune=True) # cls_emb: (batch_size, conv_channels), conv_channels = hid_dim
         else:
-            bg, cls_emb = self.pretrain_model(bg, finetune=True)
+            if return_intermediate:
+                bg, cls_emb, intermediate = self.pretrain_model(bg, finetune=True, return_intermediate=True)
+            else:
+                bg, cls_emb = self.pretrain_model(bg, finetune=True)
 
         if self.cfg.train.detach_gnn:
             if hasattr(self, 'esm_proj'):
                 cls_emb = self.esm_proj(cls_emb)
             logits = self.mlp(cls_emb)
             return logits
+        
+        # run tcn to rsd nodes.
+        if self.cfg.train.tcn:
+            rsd_embeds = self.tcn(bg) # (batch_size, hid_dim)
 
         # if readout, or pooling
         if self.readout:
@@ -506,16 +543,25 @@ class PharmHGT_FP(nn.Module):
         if hasattr(self, 'esm_proj'):
             cls_emb = self.esm_proj(cls_emb)
 
-        fused_feats = self.fusion(bg_embeds, cls_emb)  # (batch_size, hid_dim)
+        if self.cfg.train.tcn:
+            sq_emb = self.fusion_sq(cls_emb, rsd_embeds)  # (batch_size, hid_dim)
+            fused_feats = self.fusion(bg_embeds, sq_emb)
+        else:
+            fused_feats = self.fusion(bg_embeds, cls_emb)  # (batch_size, hid_dim)
+
+        if return_intermediate:
+            intermediate['cls_emb'] = cls_emb.detach().clone()
+            intermediate['bg_embed'] = bg_embeds.detach().clone()
+            intermediate['fused_feats'] = fused_feats.detach().clone()
 
         # cat_feats = torch.cat([bg_embeds, cls_emb], dim=-1)
 
-        # info("bg_embeds均值:", bg_embeds.mean().item())
-        # info("cls_emb均值:", cls_emb.mean().item())
-        # info("融合后特征均值:", fused_feats.mean().item(), st=5)
-
         # mlp
         logits = self.mlp(fused_feats)  # => shape [B, num_classes]
+
+        if return_intermediate:
+            intermediate['last_layer'] = self.mlp.return_intermediate(fused_feats)
+            return logits, intermediate
 
         return logits # shape [B, 1] for binary classification
     
@@ -554,7 +600,7 @@ class BilinearAttentionFusion(nn.Module):
         super(BilinearAttentionFusion, self).__init__()
         self.bilinear = BilinearFusion(embed_dim)
         self.norm = nn.LayerNorm(embed_dim)
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.1, batch_first=True)
         
     def forward(self, feat_seq, feat_struct):
         bilinear_out = self.bilinear(feat_seq, feat_struct)
@@ -568,22 +614,85 @@ class BilinearAttentionFusion(nn.Module):
     
 class MLP(nn.Module):
     """feed bg_embeds to MLP and give binary classification, note that num_classes=1"""
-    def __init__(self, hid_dim, num_classes, input_dim):
+    def __init__(self, num_classes, input_dim):
         super(MLP,self).__init__()
         self.mlp = nn.Sequential(
             nn.Dropout(p=0.4),
-            nn.Linear(input_dim, hid_dim),
-            nn.BatchNorm1d(hid_dim),
+            nn.Linear(input_dim, input_dim // 2),
+            nn.BatchNorm1d(input_dim // 2),
             nn.ReLU(),
-            nn.Linear(hid_dim, hid_dim),
+            nn.Linear(input_dim // 2, input_dim // 2),
             nn.ReLU(),
-            nn.Linear(hid_dim, hid_dim // 2),
+            nn.Linear(input_dim // 2, input_dim // 4),
             nn.ReLU(),
-            nn.Linear(hid_dim//2, num_classes)
+            nn.Linear(input_dim // 4, num_classes)
         )
 
     def forward(self, bg_embeds):
         return self.mlp(bg_embeds)
+    
+    def return_intermediate(self, bg_embeds):
+        return self.mlp[:-1](bg_embeds)
+    
+class AmpHGT_CT(PharmHGT_FP):
+    """
+    AmpHGT (PharmHGT_pretrained + pooling/readout) for continue training. CT: continue training.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            *args, 
+            load_pretrained=False,
+            **kwargs
+        )
+
+    def forward(self, bg):
+        logits = super().forward(bg)
+        return logits
+    
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path, cfg, device, sq_embed="ESM2", **kwargs):
+        # 1. Create model instance with proper configuration
+        model = cls(
+            cfg=cfg,
+            hid_dim=cfg.train.hid_dim,
+            act=cfg.train.act,
+            depth=cfg.train.depth,
+            atom_dim=cfg.train.atom_dim,
+            bond_dim=cfg.train.bond_dim,
+            pharm_dim=cfg.train.pharm_dim,
+            reac_dim=cfg.train.reac_dim,
+            device=device,
+            sq_embed=sq_embed,  # Use the specified embedder
+            **kwargs
+        )
+        
+        # 2. Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # 3. Handle state_dict (remove module. prefix if using DDP)
+        state_dict = {
+            k.replace('module.', ''): v
+            for k, v in checkpoint['model_state_dict'].items()
+        }
+        
+        # 4. Load state_dict with strict=False to ignore missing ESM keys
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        
+        # 5. Log the loading process
+        info(f"Loaded model from {checkpoint_path}")
+        info(f"Missing keys (expected for ESM components): {len(missing_keys)} keys")
+        info(f"Unexpected keys: {len(unexpected_keys)} keys")
+        info(f"Model has {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters")
+        
+        # 6. Ensure ESM components are in eval mode
+        if sq_embed == "ESM2":
+            if hasattr(model.pretrain_model, 'rsd_encoder'):
+                model.pretrain_model.rsd_encoder.eval()
+        elif sq_embed == "Ensemble":
+            if hasattr(model.pretrain_model, 'rsd_encoder') and hasattr(model.pretrain_model.rsd_encoder, 'esm_encoder'):
+                model.pretrain_model.rsd_encoder.esm_encoder.eval()
+        
+        return model
     
 class AmpHGT_FT(PharmHGT_FP):
     """
@@ -597,9 +706,12 @@ class AmpHGT_FT(PharmHGT_FP):
             **kwargs
         )
 
-    def forward(self, bg):
+    def forward(self, bg, return_intermediate=False):
         """ Inference-optimized forward """
         with torch.no_grad():
+            if return_intermediate:
+                logits, intermediate = super().forward(bg, return_intermediate=True)
+                return logits, intermediate
             logits = super().forward(bg)
             return logits
         

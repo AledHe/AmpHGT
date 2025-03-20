@@ -374,3 +374,133 @@ class GRUReadout(nn.Module):
         a_embed = self._pool(a_out, a_mask, a_sizes, device)  # [B, hid_dim*2]
 
         return self.linear_out(a_embed)
+    
+class TCNReadout(nn.Module):
+    def __init__(self,
+                 input_dim,
+                 hidden_dim,
+                 num_layers=3,
+                 kernel_size=3,
+                 dropout=0.1,
+                 causal=True,
+                 use_residual=True,
+                 use_batchnorm=False):
+        super().__init__()
+        self.num_layers = num_layers
+        self.kernel_size = kernel_size
+        self.dropout = dropout
+        self.causal = causal
+        self.use_residual = use_residual
+        self.use_batchnorm = use_batchnorm
+        
+        # 逐层构建 TCN blocks
+        self.convs = nn.ModuleList()
+        self.bns   = nn.ModuleList()
+        in_channels = input_dim
+        for i in range(num_layers):
+            dilation = 2 ** i  # 指数级扩张
+            # 若 causal=True, 则用右侧padding + 剪裁
+            # 若非causal, 一般做 same padding => padding = dilation*(kernel_size//2)
+            pad = (kernel_size - 1) * dilation if causal else (kernel_size//2)*dilation
+            
+            conv = nn.Conv1d(
+                in_channels=in_channels,
+                out_channels=hidden_dim,
+                kernel_size=kernel_size,
+                padding=pad,
+                dilation=dilation
+            )
+            self.convs.append(conv)
+            
+            if use_batchnorm:
+                self.bns.append(nn.BatchNorm1d(hidden_dim))
+            else:
+                self.bns.append(nn.Identity())
+            
+            in_channels = hidden_dim  # 下一层输入 = 当前层输出
+        # 最终投影层
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, bg: dgl.DGLHeteroGraph, rsd_feat_field='f_h'):
+        padded_seq, mask = self._pad_rsd_by_pos(bg, rsd_feat_field)  # [B, L, D]
+        if padded_seq.size(1) == 0:
+            # 若完全无 rsd 节点，则返回全0向量或其他替代
+            bsz = padded_seq.size(0)
+            zero_feat = padded_seq.new_zeros(bsz, self.proj.out_features)
+            return zero_feat
+        
+        # [B, L, D] -> [B, D, L]
+        x = padded_seq.transpose(1, 2)  # x: [B, D, L]
+        # 逐层因果/非因果卷积
+        for i in range(self.num_layers):
+            conv = self.convs[i]
+            bn   = self.bns[i]
+            if self.use_residual:
+                residual = x  # 残差
+            
+            out = conv(x)
+            
+            # 对于 causal TCN，需要去掉右侧多余padding
+            if self.causal:
+                pad_amount = conv.padding[0]
+                if pad_amount > 0:
+                    out = out[:, :, :-pad_amount]
+            
+            out = bn(out)
+            out = F.relu(out)
+            out = F.dropout(out, p=self.dropout, training=self.training)
+            
+            if self.use_residual:
+                # 若维度匹配，则可以加残差
+                if out.size() == residual.size():
+                    out = out + residual
+            x = out
+        # [B, D, L] -> [B, L, D]
+        x = x.transpose(1, 2)
+        # 池化
+        pooled = self._masked_mean_pool(x, mask)  # [B, D]
+        # 投影
+        graph_feat = self.proj(pooled)
+        return graph_feat
+    
+    def _pad_rsd_by_pos(self, bg, feat_field):
+        device = bg.device
+        graphs = dgl.unbatch(bg)
+        batch_size = len(graphs)
+        feats_list = []
+        lengths = []
+        for g in graphs:
+            if g.num_nodes('rsd') == 0:
+                # 空图
+                feats_list.append(torch.zeros(0, 0, device=device))
+                lengths.append(0)
+                continue
+            pos = g.nodes['rsd'].data['pos']
+            sorted_idx = torch.argsort(pos)
+            feats = g.nodes['rsd'].data[feat_field][sorted_idx]  # [num_rsd, D]
+            feats_list.append(feats)
+            lengths.append(feats.size(0))
+        max_len = max(lengths) if lengths else 0
+        if max_len == 0:
+            # 全都空
+            return (torch.zeros(batch_size, 0, 0, device=device),
+                    torch.ones(batch_size, 0, dtype=torch.bool, device=device))
+        
+        input_dim = feats_list[0].size(-1) if feats_list else 0
+        padded_seq = torch.zeros(batch_size, max_len, input_dim, device=device)
+        mask = torch.ones(batch_size, max_len, dtype=torch.bool, device=device)
+        for i, (feats, l) in enumerate(zip(feats_list, lengths)):
+            if l > 0:
+                padded_seq[i, :l] = feats
+                mask[i, :l] = False
+        return padded_seq, mask
+    
+    def _masked_mean_pool(self, seq_out, mask):
+        """
+        seq_out: [B, L, D]
+        mask: [B, L] (True 表示填充无效)
+        """
+        seq_out = seq_out.masked_fill(mask.unsqueeze(-1), 0.0)
+        sums = seq_out.sum(dim=1)  # [B, D]
+        lens = (~mask).sum(dim=1, keepdim=True).clamp(min=1)
+        return sums / lens.float()

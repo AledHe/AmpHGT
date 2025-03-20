@@ -1,11 +1,14 @@
-from functools import partial
 import os
 import json
 import tqdm
 import multiprocessing
+from rdkit import Chem
+from functools import partial
 from utils.FraSCESS.mol2heterograph_FraSCESS import get_fragment_feats
 from utils.RegularMethod.BRICSFrag import get_fragment_feats_other
-from utils.data_old import DataLoader
+from utils.data_rework import FinetuneDataLoader
+
+Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.BondProps)
 
 def record_bond_properties(mol):
     bond_properties = {}
@@ -19,8 +22,8 @@ def reassign_bond_properties(mol, bond_properties):
         mol.GetBondWithIdx(bond_idx).SetProp("LinkingBond", prop_value)
 
 def process_molecule(mol_data, method):
-    sdf_path, mol, bond_properties = mol_data
-    reassign_bond_properties(mol, bond_properties)
+    sdf_path, mol = mol_data
+    # reassign_bond_properties(mol, bond_properties)
     if method == "FraSCESS":
         result_ap, result_p, result_frag, result, brics_bonds_rules, bonds_to_break = get_fragment_feats(mol, sdf_path=sdf_path)
     elif method == "BRICS":
@@ -29,24 +32,17 @@ def process_molecule(mol_data, method):
         raise ValueError(f"Invalid method: {method}")
     return result_frag
 
-def main(count_threshold: int, output_path: str, method: str, workers: int):
+def main(cfg, count_threshold: int, output_path: str, method: str, workers: int):
     # Initialize DataLoader
-    pretrain_loader = DataLoader(cfg=None, stage="generate_vocabdict", mask_graph=None)
-    
-    # Load SDF directories
-    pretrain_loader.load_SDF_directory("/home/dak/project/AmpHGT/datasets/train/neg_cleaned_sequences_mol")
-    pretrain_loader.load_SDF_directory("/home/dak/project/AmpHGT/datasets/train/pos_cleaned_sequences_mol")
-    # pretrain_loader.load_SDF_directory("/home/ubuntu/project/NRPFeature/data/pretrain/ForSplit/neg_cleaned_sequences_mol")
-    # pretrain_loader.load_SDF_directory("/home/ubuntu/project/NRPFeature/data/pretrain/ForSplit/pos_cleaned_sequences_mol")
-    pretrain_loader.sdf_to_mol()
+    vocab_loader = FinetuneDataLoader(cfg, stage="generate_vocabdict", mask_graph=None, sdf_path=cfg.data.dataset)
 
     # Record bond properties outside multiprocessing
-    bond_properties_dict = {}
-    for sdf_path, mol in pretrain_loader.mols:
-        bond_properties_dict[sdf_path] = record_bond_properties(mol)
+    # bond_properties_dict = {}
+    # for idx, mol in enumerate(vocab_loader.mols):
+    #     bond_properties_dict[idx] = record_bond_properties(mol)
     
     # Prepare data for multiprocessing
-    mol_data_list = [(sdf_path, mol, bond_properties_dict[sdf_path]) for sdf_path, mol in pretrain_loader.mols]
+    mol_data_list = [(idx, mol) for idx, mol in enumerate(vocab_loader.mols)]
     
     # Use Manager for shared data structures
     with multiprocessing.Manager() as manager:

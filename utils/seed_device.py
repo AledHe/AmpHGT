@@ -29,51 +29,34 @@ def get_device() -> List[torch.device]:
     
     return devices
 
-def set_seed(device: Union[str, torch.device], seed: int, cuda_deterministic: bool) -> None:
-    """
-    Set the seed for random number generators and configure CUDA settings for reproducibility.
-
-    Args:
-        device (Union[str, torch.device]): The device to set the seed for. Can be 'cuda' or 'cpu'.
-        seed (int): The seed value to set.
-        cuda_deterministic (bool): Whether to use deterministic settings for CUDA.
-    """
-    print("Setting seed:", seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    if isinstance(device, str) and device == "cuda" or isinstance(device, torch.device) and device.type == "cuda":
-        torch.cuda.manual_seed_all(seed)
-        print("Set CUDA seed:", seed)
-
-        if cuda_deterministic:
-            # Set CUDA to deterministic mode
-            print("Setting CUDA to deterministic mode")
-            torch.backends.cudnn.benchmark = False
-            torch.backends.cudnn.deterministic = True
-        else:
-            # Set CUDA to non-deterministic mode for potentially better performance
-            print("Setting CUDA to non-deterministic mode")
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.deterministic = False
-
 def setup_seed_reproducibility(seed: int, cuda_deterministic: bool = True) -> List[torch.device]:
     """
-    Set up the seed and device configuration for reproducibility.
-
-    Args:
-        seed (int): The seed value to set.
-        cuda_deterministic (bool): Whether to use deterministic settings for CUDA.
-
-    Returns:
-        List[torch.device]: A list of devices used for computations.
+    优化后的种子设置函数，避免冗余操作
     """
     print("Setting up seed reproducibility")
     devices = get_device()
     print("Using devices:", devices)
-    for device in devices:
-        set_seed(device, seed, cuda_deterministic)
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    cuda_devices = [d for d in devices if (isinstance(d, str) and d == "cuda") or 
+                    (isinstance(d, torch.device) and d.type == "cuda")]
+    
+    if cuda_devices:
+        torch.cuda.manual_seed_all(seed)
+        print("Set CUDA seed:", seed)
+        
+        if cuda_deterministic:
+            print("Setting CUDA to deterministic mode")
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        else:
+            print("Setting CUDA to non-deterministic mode")
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
+    
     return devices
 
 def setup_multinodes(world_size) -> int:

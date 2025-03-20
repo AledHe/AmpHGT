@@ -5,6 +5,8 @@ import torch
 from sklearn.metrics import auc, f1_score, matthews_corrcoef, mean_absolute_error, mean_squared_error, precision_recall_curve, precision_score, r2_score, recall_score,\
     roc_auc_score, accuracy_score, log_loss, confusion_matrix, roc_curve
 
+from utils.std_logger import info
+
 def compute_accuracy(pred, target):
     return float(torch.sum(torch.max(pred.detach(), dim = 1)[1] == target).cpu().item())/len(pred)
 
@@ -12,6 +14,14 @@ def compute_need_metrics(pred, target):
     # 将prob转换为预测标签
     pred_labels = (pred >= 0.5).int().cpu()
     target_labels = target.int().cpu()
+
+    # 如果只存在一类target_labels，那么不计算precision, recall, specificity, F1 score，直接报告多少预测为正多少为负
+    if len(torch.unique(target_labels)) == 1:
+        # 直接计算预测中正负样本的数量
+        positive_count = (pred_labels == 1).sum().item()
+        negative_count = (pred_labels == 0).sum().item()
+        info(f'Only one class in target_labels, positive count: {positive_count}, negative count: {negative_count}')
+        exit()
     
     # 计算accuracy
     accuracy = accuracy_score(target_labels, pred_labels)

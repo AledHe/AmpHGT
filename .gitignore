@@ -3,12 +3,13 @@ propy/
 *.pyc
 __pycache__/
 datasets/
+datasets_*/
 txt/
 *.txt
+!vocab.txt
 huggingface/
 out_*/
 fasta*/
-configs/
 csv/
 *.7z
 *.zip

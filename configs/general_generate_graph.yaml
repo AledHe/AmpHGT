@@ -1,0 +1,41 @@
+train:
+  seed: 42
+  cuda_deterministic: False
+  mask_edge: False
+  mask_atom: True
+  mask_fragment: True
+  mask_rsd: True
+  mask_rate: 0.6 # how many atoms in a peptide should be masked.
+  hid_dim: 300
+  atom_dim: 42 # do not change
+  bond_dim: 14 # do not change
+  pharm_dim: 196 # do not change
+  rsd_dim: 300
+  reac_dim: 14
+  frag_method: "FraSCESS"
+  train_tag: "s2_finetune"
+
+data:
+  vocablist: tokenizer/vocablist/vocab_1.json
+  train_sdf_pos: datasets_xuamp/XU_train_positive.smi
+  valid_sdf_pos: datasets_xuamp/XU_val_positive.smi
+  test_sdf_pos: datasets_xuamp/XU_AMP_positive.smi
+  train_sdf_neg: datasets_xuamp/XU_train_negative.smi
+  valid_sdf_neg: datasets_xuamp/XU_val_negative.smi
+  test_sdf_neg: datasets_xuamp/XU_nonAMP_negative.smi
+  tmp_dir: ./tmp/finetune_binary
+  chunk_size: 2000
+  # save_path: "/home/ubuntu/project/amphgt_refactor/datasets/split/pretrain"
+  num_workers: 2
+
+logger:
+  log: True
+  log_dir: "${output_dir}/${now:%m-%d-%H-%M}"
+  log_per_steps: 5
+  tracking_uri: "${output_dir}/mlflow_tracking"
+  mlflow_exp_name: "Finetune_FraSCESS"
+  test_run: False
+
+mode:
+  nni: false  # If using NNI for hyperparameter tuning
+  ddp: false   # Distributed Data Parallel mode

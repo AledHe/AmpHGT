@@ -2,44 +2,62 @@ train:
   seed: 42
   log_interval: 5  # Log every 100 steps
   # val_interval: 1000
-  cuda_deterministic: False
+  cuda_deterministic: True
+  mask_edge: False
+  mask_atom: True
+  mask_fragment: True
+  mask_rsd: True
+  mask_rate: 0.6 # how many atoms in a peptide should be masked.
   batch_size: 128
   hid_dim: 300
   act: "relu"
   depth: 5
-  num_task: 1
   atom_dim: 42 # do not change
   bond_dim: 14 # do not change
   pharm_dim: 196 # do not change
+  rsd_dim: 300
   reac_dim: 14
   num_layer: 5
   num_tasks: 1
+  lr: 0.0001
+  decay: 0
+  epochs: 200
+  patience: 20
   frag_method: "FraSCESS"
-  train_tag: "s3_inference"
+  train_tag: "s2_finetune"
   view: "apjr"
   sq_embed: "CovTrans" # CovTrans or ESM2
   load_pretrained: False # if not, train from scratch on finetune data
-  readout: "none" # "att": HierAttnReadout, "gru": GRUReadout, "": no readout
+  readout: "none" # "att": HierAttnReadout, "gru": GRUReadout, "none": no readout
   pooling: "mean" # works when not gru/att readout, mean, max, sum
   fusion: "gate"
   tcn: False
+  full_ft: False
   unlabel_checkpoint_path: ""
-  checkpoint_path: out_finetune_binary/02-22-09-45/checkpoint_epoch_8_best/model.pt
+  checkpoint_path: ""
   detach_gnn: False
+  continue_training: False
   return_intermediate: False
 
 data:
   vocablist: tokenizer/vocablist/vocab_1.json
+  train_sdf_pos: datasets_xuamp/XU_train_positive.smi
+  valid_sdf_pos: datasets_xuamp/XU_val_positive.smi
   test_sdf_pos: datasets_xuamp/XU_AMP_positive.smi
+  train_sdf_neg: datasets_xuamp/XU_train_negative.smi
+  valid_sdf_neg: datasets_xuamp/XU_val_negative.smi
   test_sdf_neg: datasets_xuamp/XU_nonAMP_negative.smi
   tmp_dir: ./tmp/finetune_binary
   chunk_size: 2000
   # save_path: "/home/ubuntu/project/amphgt_refactor/datasets/split/pretrain"
-  num_workers: 2
+  num_workers: 4
 
 logger:
   log: True
   log_dir: "${output_dir}/${now:%m-%d-%H-%M}"
+  log_per_steps: 5
+  tracking_uri: "${output_dir}/mlflow_tracking"
+  mlflow_exp_name: "Finetune_FraSCESS"
   test_run: False
 
 mode:

@@ -24,7 +24,7 @@ train:
   fusion: "gate"
   tcn: False
   unlabel_checkpoint_path: ""
-  checkpoint_path: out_finetune_binary/02-22-09-45/checkpoint_epoch_8_best/model.pt
+  checkpoint_path: 
   detach_gnn: False
   return_intermediate: False
 
@@ -36,6 +36,12 @@ data:
   chunk_size: 2000
   # save_path: "/home/ubuntu/project/amphgt_refactor/datasets/split/pretrain"
   num_workers: 2
+
+umap:
+  n_neighbors: 15
+  min_dist: 0.1
+  out_path: "${output_dir}/${now:%m-%d-%H-%M}"
+
 
 logger:
   log: True

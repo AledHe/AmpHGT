@@ -17,6 +17,14 @@ This repository contains the code for the paper and provides all necessary inter
 
 ---
 
+## Env Setup
+
+It is recommend to create a new conda environment with our environment.yml by
+
+```bash
+conda env create -f environment.yml
+```
+
 ## Training the Model
 
 There are two primary approaches for training:

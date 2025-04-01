@@ -10,7 +10,7 @@ This repository contains the code for the paper and provides all necessary inter
   `main.py` provides the interface for model training and inference.
 
 - **Training Data:**
-  The training data used in the paper can be downloaded from [AmpHGT_db](#).
+  The training data used in the paper can be downloaded from [AmpHGT_db](https://github.com/AledHe/AmpHGT_db).
 
 - **Configuration Options:**
   You can either modify the YAML configuration files in the `configs/` directory or override parameters via command-line arguments.
